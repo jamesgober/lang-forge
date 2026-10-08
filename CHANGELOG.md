@@ -16,7 +16,8 @@
 ## [1.0.0] - 2026-10-07
 
 The API freeze. The 0.2.0 surface, the `.lsf` schematic format, and the
-parser's guarantees are now the stable `1.x` contract; the code is unchanged.
+parser's guarantees are now the stable `1.x` contract. The only code change
+is a lint fix for newer Clippy.
 
 ### Added
 
@@ -31,6 +32,12 @@ parser's guarantees are now the stable `1.x` contract; the code is unchanged.
 ### Changed
 
 - Version 1.0.0. `README.md` and `docs/API.md` mark the API stable.
+
+### Fixed
+
+- The lexer's byte-class table is built without a one-byte array that
+  Clippy on Rust 1.99 rejects (`clippy::byte_char_slices`), which failed the
+  stable CI jobs.
 
 ---
 

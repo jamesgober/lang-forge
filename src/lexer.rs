@@ -224,7 +224,10 @@ impl Lexer {
         }
         class[b'\r' as usize] |= C_CR;
         class[b'\n' as usize] |= C_LF;
-        for b in (b'a'..=b'z').chain(b'A'..=b'Z').chain([b'_']) {
+        for b in (b'a'..=b'z')
+            .chain(b'A'..=b'Z')
+            .chain(core::iter::once(b'_'))
+        {
             class[b as usize] |= C_IDENT;
         }
         for b in b'0'..=b'9' {
