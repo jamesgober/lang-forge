@@ -1,0 +1,23 @@
+# calc.lsf - a calculator: bindings and arithmetic expressions.
+
+[language]
+name       = "calc"
+version    = "1.0.0"
+extensions = ["calc"]
+
+[lexer]
+line_comments = ["#"]
+
+[rules]
+program = "stmt*"
+stmt    = "'let' IDENT '=' expr ';' | expr ';'"
+group   = "'(' expr ')'"
+
+[rules.expr]
+operand = "NUMBER | IDENT | group"
+levels  = [
+    { left   = ["+", "-"] },
+    { left   = ["*", "/", "%"] },
+    { prefix = ["-"] },
+    { right  = ["^"] },
+]

@@ -1,0 +1,46 @@
+# mini.lsf - a small imperative language: functions, variables, control flow,
+# and expressions with the usual precedence. Forged by lang-forge.
+
+[language]
+name       = "mini"
+version    = "0.1.0"
+extensions = ["mini"]
+
+[lexer]
+line_comments   = ["//"]
+block_comments  = [["/*", "*/"]]
+nested_comments = true
+strings         = ['"']
+
+[rules]
+program  = "_item*"
+_item    = "function | stmt"
+function = "'fn' IDENT params block"
+params   = "'(' (IDENT (',' IDENT)*)? ')'"
+block    = "'{' stmt* '}'"
+stmt     = """
+    'let' IDENT '=' expr ';'
+  | 'if' expr block ('else' stmt)?
+  | 'while' expr block
+  | 'return' expr? ';'
+  | block
+  | expr ';'
+"""
+args     = "expr (',' expr)*"
+group    = "'(' expr ')'"
+
+[rules.expr]
+operand = "NUMBER | STRING | IDENT | 'true' | 'false' | group"
+levels  = [
+    { right   = ["="],                                  node = "assign" },
+    { left    = ["||"] },
+    { left    = ["&&"] },
+    { none    = ["==", "!=", "<", "<=", ">", ">="],     node = "compare" },
+    { left    = ["+", "-"] },
+    { left    = ["*", "/", "%"] },
+    { prefix  = ["-", "!"],                             node = "unary" },
+    { postfix = ["("], then = "args? ')'",              node = "call" },
+]
+
+[capabilities]
+include = ["unused-variables"]

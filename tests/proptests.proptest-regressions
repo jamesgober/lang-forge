@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4aa2b627d3826167cb4fcd6d18b1028844df1297ac8ea4336a8c406fecd6deca # shrinks to src = "fn a() {\nif 0 {\nreturn 0 == 0 == 0;\n}\n}"

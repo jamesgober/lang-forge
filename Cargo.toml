@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "lang-forge"
-version = "0.1.0"
+version = "1.0.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,13 +16,13 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "LexerSketch: the capstone language generator."
+description = "LexerSketch: forge a working language front end - lexer, parser, and lossless syntax tree - from a .lsf schematic."
 
 # Keywords (5 max)
-keywords = [compiler,language,generator,codegen]
+keywords = ["language", "generator", "parser", "compiler", "dsl"]
 
 # Categories
-categories = [development-tools,compilers]
+categories = ["development-tools", "compilers", "parsing"]
 
 # Links
 homepage      = "https://github.com/jamesgober/lang-forge"
@@ -45,15 +45,25 @@ path = "src/lib.rs"
 # #################################
 [features]
 default = ["std"]
-std = []
-# Serialization support.
-serde = ["dep:serde"]
+# The standard library. Without it the crate is `no_std` and needs only `alloc`.
+std = ["syntax-lang/std", "diag-lang/std", "pass-lang/std"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
+# The family's lossless concrete syntax tree. A forged language parses into a
+# `syntax_lang::Node`, so its trees feed the formatter, incremental reparser,
+# language server, and tree-sitter crates of the family unchanged.
+syntax-lang = { version = "1", default-features = false }
+# Diagnostics. Schematic errors and parse errors are `diag_lang::Diagnostic`s
+# with labelled spans, rendered with source context by `diag_lang::Renderer`.
+diag-lang = { version = "1", default-features = false }
+# The pass manager. A schematic names its capabilities; `Language::pipeline`
+# assembles the matching passes, in schematic order, into a `PassManager`.
+pass-lang = { version = "1", default-features = false }
+# UAX #31 identifier rules (XID_Start / XID_Continue) for Unicode identifiers.
+unicode-lang = { version = "1", default-features = false }
 
 
 # DEV DEPENDENCIES
@@ -61,9 +71,6 @@ serde = { version = "1", optional = true, default-features = false, features = [
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
-
-[target.'cfg(loom)'.dev-dependencies]
-loom = "0.7"
 
 
 # BENCHMARKS

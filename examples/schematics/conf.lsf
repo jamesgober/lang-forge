@@ -1,0 +1,16 @@
+# conf.lsf - an INI-style configuration format, where line breaks matter.
+
+[language]
+name       = "conf"
+extensions = ["conf", "ini"]
+
+[lexer]
+newlines      = true
+line_comments = [";"]
+strings       = ['"']
+
+[rules]
+file    = "(section | pair | NEWLINE)*"
+section = "'[' IDENT ']' NEWLINE"
+pair    = "IDENT '=' value NEWLINE"
+value   = "STRING | NUMBER | IDENT | 'on' | 'off'"

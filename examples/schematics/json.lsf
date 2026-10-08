@@ -1,0 +1,16 @@
+# json.lsf - JSON (RFC 8259), with its single document rule.
+
+[language]
+name       = "json"
+extensions = ["json"]
+
+[lexer]
+identifiers = "ascii"
+strings     = ['"']
+
+[rules]
+document = "value"
+value    = "object | array | STRING | NUMBER | '-' NUMBER | 'true' | 'false' | 'null'"
+object   = "'{' (member (',' member)*)? '}'"
+member   = "STRING ':' value"
+array    = "'[' (value (',' value)*)? ']'"
