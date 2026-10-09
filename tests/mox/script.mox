@@ -1,0 +1,106 @@
+<?mox
+declare(strict_types=1);
+namespace App\Models;
+
+use App\Support\{Arr, Str};
+use function App\Support\helper;
+
+#[Entity(table: "users")]
+final class User extends Model implements \JsonSerializable, Countable
+{
+    use HasEvents, SoftDeletes {
+        HasEvents::boot insteadof SoftDeletes;
+        SoftDeletes::boot as protected bootSoftDeletes;
+    }
+
+    public const ROLE_ADMIN = 'admin';
+    private static int $count = 0;
+    protected ?string $name = null;
+
+    public function __construct(private readonly int $id, string $name = "guest", array ...$rest)
+    {
+        $this->name = $name;
+        self::$count++;
+    }
+
+    public static function find(int|string $id): ?static
+    {
+        return static::query()->where('id', '=', $id)?->first();
+    }
+
+    public async function load(): array
+    {
+        $rows = await $this->db->fetch("SELECT * FROM users WHERE id = {$this->id}");
+        $task = spawn fn() => $this->refresh();
+        foreach ($rows as $key => &$row) {
+            if ($row['active'] && !$row['banned']) {
+                $row['label'] = "User {$row['name']} #$key has $row[role] role";
+            } elseif ($row instanceof Banned) {
+                continue 1;
+            } else {
+                unset($rows[$key]);
+            }
+        }
+        return match (true) {
+            count($rows) > 10, count($rows) === 0 => [],
+            default => array_map(fn($r) => $r['id'] ?? 0, $rows),
+        };
+    }
+
+    public function render(): string
+    {
+        $html = <<<HTML
+            <div class="user">
+              <h1>{$this->name}</h1>
+              <p>$this->name is user #{$this->id}</p>
+            </div>
+            HTML;
+        $raw = <<<'RAW'
+            No $interpolation {$here}
+            RAW;
+        return $html . $raw;
+    }
+}
+
+enum Suit: string implements HasColor
+{
+    case Hearts = 'H';
+    case Spades = 'S';
+
+    public function color(): string
+    {
+        return match ($this) {
+            Suit::Hearts => 'Red',
+            Suit::Spades => 'Black',
+        };
+    }
+}
+
+function &counter(int $start = 0): \Generator
+{
+    static $calls = 0;
+    $calls += 1;
+    $closure = function (int $x) use (&$start, $calls): int {
+        return $x + $start * $calls;
+    };
+    yield from range(1, 3);
+    yield 'key' => $closure(2);
+    try {
+        $value = (int) "42" + (float) 1.5 ** 2 - -1;
+        $list = [1, 2, 3,];
+        [$a, $b] = $list;
+        $obj = new class(1) extends Base { public $x = 1; };
+        $value ??= $a <=> $b;
+        echo $value, PHP_EOL;
+    } catch (\RuntimeException | \LogicException $e) {
+        throw new \Exception("failed: " . $e->getMessage(), previous: $e);
+    } finally {
+        print "done\n";
+    }
+    return $start;
+}
+
+$u = new User(1, name: 'Ada');
+$u?->load();
+echo __LINE__ . ' ' . __FILE__;
+exit(0);

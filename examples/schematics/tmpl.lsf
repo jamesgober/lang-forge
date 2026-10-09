@@ -1,0 +1,52 @@
+# A small template language in format 2 (LSF2): text with `{{ … }}` holes and
+# `{% … %}` tags, strings with interpolation, contextual keywords, and labelled
+# fields. `cargo run --example template` forges it and renders a page.
+
+[sketch]
+format = 2
+
+[language]
+name         = "tmpl"
+display_name = "Tmpl"
+version      = "1.0.0"
+extensions   = ["tmpl"]
+
+[lexer]
+initial_mode = "text"            # a file starts as template text
+
+[lexer.keywords]
+contextual = ["in", "endfor"]    # still usable as names inside expressions
+
+[lexer.tokens]
+HOLE_OPEN  = { literal = "{{", modes = ["text"], action = "push main" }
+HOLE_CLOSE = { literal = "}}", action = "pop" }
+TAG_OPEN   = { literal = "{%", modes = ["text"], action = "push main" }
+TAG_CLOSE  = { literal = "%}", action = "pop" }
+VAR        = { regex = '\$[a-z_][a-z_0-9]*' }
+
+[lexer.modes.text]
+tokens = ["HOLE_OPEN", "TAG_OPEN"]
+text   = "TEXT"
+
+[lexer.strings.STR]
+open        = '"'
+interpolate = [{ open = "{", when_next = '\$', close = "}", rule = "expr" }]
+
+[rules]
+page     = "items:_item*"
+_item    = "TEXT | hole | for_tag"
+hole     = "HOLE_OPEN value:expr HOLE_CLOSE"
+# `{% endfor %}` also begins with TAG_OPEN: the predicate stops the body there
+# (without it, forging reports the overlap with the input `TAG_OPEN endfor`).
+for_tag  = "TAG_OPEN 'for' var:VAR 'in' seq:expr TAG_CLOSE body:(!(TAG_OPEN 'endfor') _item)* TAG_OPEN 'endfor' TAG_CLOSE"
+call     = "callee:IDENT '(' (args:expr (',' args:expr)*)? ')'"
+
+[rules.expr]
+operand = "call | VAR | IDENT | NUMBER | STR"
+levels  = [
+    { left = ["|"], node = "filter" },
+    { left = ["~"], node = "concat" },
+]
+
+[ast]
+Item = ["hole", "for_tag"]

@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, no dependencies outside the <code>-lang</code> family.
     </p>
     <blockquote>
-        <strong>1.0.0 is the API freeze.</strong> The public surface, the schematic format, and the parser's guarantees are stable and follow Semantic Versioning &mdash; no breaking changes before <code>2.0</code>. See <a href="./docs/API.md#stability"><code>docs/API.md</code></a> for the frozen surface and the SemVer promise, and <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>.
+        <strong>2.0.0-alpha.1 is a pre-release of 2.0.</strong> It adds LSF2, the format-2 sketch syntax (token classes, lexer modes, interpolated strings and heredocs, contextual keywords, layout, labelled fields, predicates, injections), multi-file sketches, language images, and diagnostic codes. A format-1 schematic forges and parses exactly as in 1.x. The breaking changes are small and listed with a migration guide in <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>; the format-2 surface may still change before <code>2.0.0</code>. See <a href="./docs/API.md#stability"><code>docs/API.md</code></a>.
     </blockquote>
 </div>
 
@@ -38,12 +38,14 @@
 
 ## The model
 
-Four types and one alias, one per job:
+One type per job:
 
-- A **[`Language`](./docs/API.md#language)** is a forged language: a lexer, a parser, and the kinds of its tree. It is immutable, `Send` and `Sync`, and parses as often as you like.
-- A **[`Parse`](./docs/API.md#parse)** is one result: the lossless tree, the source, and the diagnostics. Parsing never fails.
-- A **[`Kind`](./docs/API.md#kind)** names a token or node in the tree. It is a small `Copy` value that compares like an enum.
-- An **[`Error`](./docs/API.md#error)** lists everything wrong with a schematic, each problem pointing into the schematic text.
+- A **[`Language`](./docs/API.md#language)** is a forged language: a lexer, a parser, and the kinds of its tree. It is immutable, `Send` and `Sync`, parses as often as you like, and saves to a byte image that loads without forging.
+- A **[`Parse`](./docs/API.md#parse)** is one result: the lossless tree, the source, the diagnostics, and any injected sub-trees. Parsing never fails.
+- A **[`Kind`](./docs/API.md#kind)** names a token or node in the tree. It is a small `Copy` value that compares like an enum, has a dense public index, and — in a format-2 tree — carries the field label of its edge.
+- A **[`Field`](./docs/API.md#field-and-cardinality)** describes a labelled field of a node kind: its name, the kinds it holds, and how many.
+- A **[`Sketch`](./docs/API.md#sketch)** holds the files of a multi-file sketch.
+- An **[`Error`](./docs/API.md#error)** lists everything wrong with a schematic, each problem pointing into the schematic text and carrying a stable code.
 - A **[`Capability`](./docs/API.md#capability)** is a boxed `pass-lang` pass that a schematic can include by name.
 
 <br>
@@ -56,7 +58,10 @@ What the crate guarantees:
 | Every tree is lossless: it covers every byte of the source, whitespace and comments included. | Tested on every parse in the suite, and as a property over arbitrary input. |
 | On input without errors, the tree is the one the grammar describes. | A strict reference parser runs in the tests; whenever the recovering parser reports no error, the two trees must be identical. |
 | A schematic the parser could not run is refused when it is forged. | Left recursion, repetitions that could loop forever, unreachable alternatives, and literals the lexer cannot produce are all errors, with the rule and the fix named. |
-| Forging a hostile schematic takes bounded memory. | The schematic's size (8 MiB), nesting (64 levels), and the tables that grow with rules times token kinds (256 MiB) are capped, and checked before anything that size is allocated. A counting allocator in [`tests/memory.rs`](./tests/memory.rs) measures it. |
+| Forging a hostile schematic takes bounded memory. | The schematic's size (8 MiB), nesting (64 levels), and the tables that grow with rules times token kinds (256 MiB) are capped, and checked before anything that size is allocated. A counting allocator in [`tests/memory.rs`](./tests/memory.rs) measures it. Format 2 adds budgets on regex automata, lexer modes (and the mode stack at run time), labels, and suggestion work. |
+| A format-1 schematic means what it meant in 1.x. | The format-1 reader is the 1.x reader, unchanged; the 1.x test suite runs against it. |
+| A greedy repetition never silently rejects valid input (format 2). | The LL(2) overlap check refuses it with a witness input (`LSF4301`), unless the rule acknowledges it. |
+| Loading a language image never panics. | Every index and length in an image is checked before use; property tests load thousands of mutated images and parse with whatever loads. |
 
 <hr>
 <br>
@@ -65,7 +70,7 @@ What the crate guarantees:
 
 ```toml
 [dependencies]
-lang-forge = "1"
+lang-forge = "2.0.0-alpha.1"
 ```
 
 Or from the terminal:
@@ -148,13 +153,13 @@ assert_eq!(parse.tree().text(source), Some(source));
 let mut map = SourceMap::new();
 map.add("main.calls", source).expect("fits");
 let report = Renderer::new().render(&parse.diagnostics()[0], &map);
-assert!(report.contains("error: expected `)`, found `;`"));
+assert!(report.contains("error[LF1000]: expected `)`, found `;`"));
 assert!(report.contains("main.calls:2:18"));
 # Ok::<(), lang_forge::Error>(())
 ```
 
 ```text
-error: expected `)`, found `;`
+error[LF1000]: expected `)`, found `;`
  --> main.calls:2:18
   |
 2 | read(file, buffer;
@@ -186,6 +191,58 @@ assert_eq!(messages, [
 let help: Vec<&str> = err.diagnostics()[0].help().collect();
 assert_eq!(help, ["did you mean `statement`?"]);
 ```
+
+<hr>
+<br>
+
+## Format 2: LSF2
+
+A sketch that says `[sketch] format = 2` gets LexerSketch's full syntax: its own token classes (regular expressions with conditions), lexer modes with a mode stack, string classes with interpolation, heredocs and raw delimiters, contextual and case-insensitive keywords, indentation layout, labelled fields on tree edges, predicates and back-references, injections, and `[ast]` supertypes. Without `[sketch]` (or with `format = 1`) a schematic is read exactly as 1.x read it.
+
+```rust
+use lang_forge::Language;
+
+let lang = Language::from_lsf(r##"
+[sketch]
+format = 2
+
+[language]
+name = "tmpl"
+version = "1.0.0"
+
+[lexer]
+initial_mode = "text"
+
+[lexer.tokens]
+OPEN  = { literal = "{{", modes = ["text"], action = "push main" }
+CLOSE = { literal = "}}", action = "pop" }
+VAR   = { regex = '\$[a-z]+' }
+
+[lexer.modes.text]
+tokens = ["OPEN"]
+text   = "TEXT"
+
+[lexer.strings.STR]
+open        = '"'
+interpolate = [{ open = "{", close = "}", rule = "expr" }]
+
+[rules]
+page = "(TEXT | hole)*"
+hole = "OPEN value:expr CLOSE"
+expr = "VAR | STR"
+"##)?;
+
+let parse = lang.parse("Hi {{ \"dear {$name}\" }}!");
+assert!(!parse.has_errors());
+
+// Fields are on the tree's edges: walk by name, not by position.
+let hole = parse.tree().child_nodes().next().expect("a hole");
+let value = lang.label_id("value").expect("a label");
+assert!(hole.children().any(|c| c.kind().label() == Some(value)));
+# Ok::<(), lang_forge::Error>(())
+```
+
+LexerSketch's flagship, Mox (PHP's syntax with template islands, `$variables`, interpolation, heredocs, and `async`/`await` as contextual keywords), forges from its ~1000-line sketch in about 25 ms and parses its sample scripts and templates without a diagnostic; see [`tests/mox.rs`](./tests/mox.rs). Every key of LSF2's syntax sections and its status in this release is in the [coverage table](./docs/API.md#lsf2-coverage).
 
 <hr>
 <br>
@@ -299,7 +356,7 @@ assert!(!parse.has_errors()); // a warning, not an error
 
 ## Examples
 
-Five runnable examples ship in [`examples/`](./examples), with four schematics in [`examples/schematics/`](./examples/schematics): `calc.lsf`, `json.lsf`, `mini.lsf` (functions, control flow, eight precedence levels), and `conf.lsf` (an INI-style format where line breaks matter).
+Six runnable examples ship in [`examples/`](./examples), with five schematics in [`examples/schematics/`](./examples/schematics): `calc.lsf`, `json.lsf`, `mini.lsf` (functions, control flow, eight precedence levels), `conf.lsf` (an INI-style format where line breaks matter), and `tmpl.lsf` (a format-2 template language).
 
 - **Calc** — forges `calc.lsf`, parses a program, and evaluates it by walking the tree: the smallest complete interpreter.
   ```bash
@@ -321,6 +378,10 @@ Five runnable examples ship in [`examples/`](./examples), with four schematics i
 - **Highlight** — syntax highlighting from `Language::lex` alone: every token, trivia included, painted by kind.
   ```bash
   cargo run --example highlight
+  ```
+- **Template** — a format-2 template renderer from `tmpl.lsf`: lexer modes, interpolated strings, contextual keywords, a tree walked by field name, and the same page rendered again from the language's saved image.
+  ```bash
+  cargo run --example template
   ```
 
 <hr>
@@ -345,8 +406,13 @@ Measured with the benchmarks in [`benches/`](./benches), x86_64, Rust stable, re
 | `parse/speculative/nested_60` | The same statements nested 60 blocks deep, every level rewinding its first alternative (146 KB). | ~38 ms | — |
 | `parse/calc/chain_100k` | A 100,000-operand sum: 100,000 nested operator nodes. | ~37 ms | ~14 ms |
 | `parse/mini/errors` | 180 KB where every statement has a mistake. | ~25 ms | ~8.8 ms |
+| `v2/forge/mox` | Forge the ~1,000-line Mox sketch (format 2). | ~23 ms | — |
+| `v2/image/mox/from` | Load and validate Mox's image instead of forging. | ~0.25 ms | — |
+| `v2/lex/mox_script/1MB` | Tokenize 1 MB of Mox script (mode-stack scanner). | ~12.7 ms (79 MiB/s) | — |
+| `v2/parse/mox_script/1MB` | Parse 1 MB of Mox script. | ~70 ms | — |
+| `v2/parse/mox_template/256KB` | Parse 256 KB of Mox template (HTML with islands). | ~7.6 ms | — |
 
-On large inputs the cost is dominated by the tree itself: on Linux, for the 1 MB mini file, lexing takes about 2 ms and the parser about 3 ms, while allocating the tree's nodes takes about 6 ms and freeing them 13 ms. Run them yourself:
+The format-1 rows were measured for 1.x; 2.0.0-alpha.1 measures within noise of 1.0.1 on them when the two run back to back, except forging (up to about 1 µs slower), the operator chain (6–12 %), and error-heavy input (10–19 %) — see the [release notes](./docs/release/v2.0.0-alpha.1.md#measurements). The format-2 scanner is about five times slower per byte than format 1's derived lexer. On large inputs the cost is dominated by the tree itself: on Linux, for the 1 MB mini file, lexing takes about 2 ms and the parser about 3 ms, while allocating the tree's nodes takes about 6 ms and freeing them 13 ms. Run them yourself:
 
 ```bash
 cargo bench --bench bench
@@ -380,6 +446,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo bench --bench bench
 ```
 
+Format 2 has its own suites: [`tests/v2_lexer.rs`](./tests/v2_lexer.rs) and [`tests/v2_grammar.rs`](./tests/v2_grammar.rs) (every feature, with its diagnostics and codes), [`tests/mox.rs`](./tests/mox.rs) (the Mox sketch and representative scripts and templates), [`tests/sketch.rs`](./tests/sketch.rs) (multi-file sketches), [`tests/image.rs`](./tests/image.rs) (images, including mutated ones), and [`tests/regressions_v2.rs`](./tests/regressions_v2.rs) (forging and lexing budgets on hostile input). The parser's format-2 properties hold the recovering parser to the strict reference parser and memoized to unmemoized parsing, labels included.
+
 The property tests in [`tests/proptests.rs`](./tests/proptests.rs) generate random valid mini programs, which must parse without a single diagnostic; random token soup and arbitrary Unicode text, which must parse into lossless, properly nested trees in every example language; and arbitrary and randomly mutated schematics, which must forge or fail cleanly. Further properties, in the parser's unit tests, hold the recovering parser to a strict reference parser on every input it accepts without error, and require memoization never to change a tree or a diagnostic on input within the depth limit. [`tests/regressions.rs`](./tests/regressions.rs) keeps every input an adversarial review used against the crate — stack-exhausting grammars, exponential and quadratic speculation, recursion without progress, hostile schematics — and holds them to time and stack bounds; [`tests/memory.rs`](./tests/memory.rs) measures peak heap use with a counting allocator and holds forging and parsing to memory bounds. Every `rust` example in this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a doctest.
 
 <hr>
@@ -398,7 +466,7 @@ The crate uses no operating-system facilities and no platform-specific code; a s
 
 ## Contributing
 
-See [`REPS.md`](./REPS.md) for the engineering standards every change is held to, and [`dev/ROADMAP.md`](./dev/ROADMAP.md) for what may come in 1.x. Before a PR: `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` must be clean.
+See [`REPS.md`](./REPS.md) for the engineering standards every change is held to, and [`dev/ROADMAP.md`](./dev/ROADMAP.md) for what comes next in 2.0. Before a PR: `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` must be clean.
 
 <br>
 

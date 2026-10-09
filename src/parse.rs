@@ -4,7 +4,7 @@ use alloc::{string::String, vec::Vec};
 use core::fmt::Write as _;
 
 use diag_lang::{Diagnostic, Severity};
-use syntax_lang::{Element, Node};
+use syntax_lang::{Element, Node, Span};
 
 use crate::{Language, kind::Kind};
 
@@ -53,6 +53,7 @@ pub struct Parse<'a> {
     source: &'a str,
     tree: Node<Kind>,
     diagnostics: Vec<Diagnostic>,
+    injections: Vec<Injection<'a>>,
 }
 
 impl<'a> Parse<'a> {
@@ -61,13 +62,52 @@ impl<'a> Parse<'a> {
         source: &'a str,
         tree: Node<Kind>,
         diagnostics: Vec<Diagnostic>,
+        injections: Vec<Injection<'a>>,
     ) -> Self {
         Self {
             language,
             source,
             tree,
             diagnostics,
+            injections,
         }
+    }
+
+    /// The injections found in the source (format 2), in source order: the
+    /// ranges `[injections]` and `embedded` tokens with `parse` name. A
+    /// self-injection carries its own [`tree`](Injection::tree), parsed with
+    /// this language; an injection of another language, or one the sketch
+    /// leaves to the editor, carries only its range.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lang_forge::Language;
+    ///
+    /// let lang = Language::from_lsf(r#"
+    ///     [sketch]
+    ///     format = 2
+    ///     [language]
+    ///     name = "tpl"
+    ///     version = "1.0.0"
+    ///     [lexer.strings.QUOTED]
+    ///     open = '"'
+    ///     embedded = [{ token = "REF", regex = '\$[a-z]+', parse = "ref" }]
+    ///     [rules]
+    ///     file = "QUOTED*"
+    ///     ref = "'$' IDENT"
+    ///     "#)?;
+    /// let parse = lang.parse(r#""hello $name""#);
+    /// let injection = &parse.injections()[0];
+    /// assert_eq!(injection.language(), "self");
+    /// assert_eq!(&parse.source()[injection.span().start().to_usize()..injection.span().end().to_usize()], "$name");
+    /// let tree = injection.tree().expect("a self-injection is parsed");
+    /// assert_eq!(*tree.kind(), lang.kind("ref").expect("a rule"));
+    /// # Ok::<(), lang_forge::Error>(())
+    /// ```
+    #[must_use]
+    pub fn injections(&self) -> &[Injection<'a>] {
+        &self.injections
     }
 
     /// The root of the syntax tree: a node of the start rule's kind that
@@ -227,6 +267,11 @@ impl<'a> Parse<'a> {
             for _ in 0..depth {
                 out.push_str("  ");
             }
+            // A field label (format 2) prefixes the element it labels.
+            if let Some(label) = kind.label().and_then(|l| self.language.label_name(l)) {
+                out.push_str(label);
+                out.push(':');
+            }
             // Writing to a `String` cannot fail.
             let _ = write!(out, "{}@{start}..{end}", self.language.kind_name(kind));
         };
@@ -265,5 +310,93 @@ impl<'a> Parse<'a> {
             out.push('\n');
         }
         out
+    }
+}
+
+/// A range of a parsed source covered by an injection (LSF2 §12): another
+/// language's content, or a token of this language whose text has structure
+/// of its own. See [`Parse::injections`].
+///
+/// # Examples
+///
+/// ```
+/// use lang_forge::Language;
+///
+/// // `$name.field` inside a string is parsed by the `path` rule.
+/// let lang = Language::from_lsf(
+///     "[sketch]\nformat = 2\n[language]\nname = \"s\"\nversion = \"1.0.0\"\n\
+///      [lexer.strings.DQ]\nopen = '\"'\nembedded = [{ token = \"DQ_VAR\", regex = '\\$[a-z]+(\\.[a-z]+)*', parse = \"path\" }]\n\
+///      interpolate = [{ open = \"{\", close = \"}\", rule = \"path\" }]\n\
+///      [lexer.tokens]\nVAR = { regex = '\\$[a-z]+' }\n\
+///      [rules]\nfile = \"DQ*\"\npath = \"VAR ('.' IDENT)*\"\n",
+/// )?;
+/// let src = "\"hello $user.name\"";
+/// let parse = lang.parse(src);
+/// let injection = &parse.injections()[0];
+/// assert_eq!((injection.id(), injection.language(), injection.is_editor()), ("DQ_VAR", "self", false));
+/// assert_eq!(injection.span().start().to_usize(), 7);
+/// let tree = injection.tree().expect("a self-injection is parsed");
+/// assert_eq!(lang.kind_name(*tree.kind()), "path");
+/// assert_eq!(tree.text(src), Some("$user.name"));
+/// # Ok::<(), lang_forge::Error>(())
+/// ```
+#[derive(Clone, Debug)]
+pub struct Injection<'a> {
+    id: &'a str,
+    language: &'a str,
+    span: Span,
+    tree: Option<Node<Kind>>,
+    editor: bool,
+}
+
+impl<'a> Injection<'a> {
+    pub(crate) fn new(
+        id: &'a str,
+        language: &'a str,
+        span: Span,
+        tree: Option<Node<Kind>>,
+        editor: bool,
+    ) -> Self {
+        Self {
+            id,
+            language,
+            span,
+            tree,
+            editor,
+        }
+    }
+
+    /// The injection's id from `[injections]`, or the token class's name for
+    /// an `embedded` token with `parse`.
+    #[must_use]
+    pub fn id(&self) -> &'a str {
+        self.id
+    }
+
+    /// The injected language: `"self"`, or the name the sketch gives.
+    #[must_use]
+    pub fn language(&self) -> &'a str {
+        self.language
+    }
+
+    /// The range of the source the injection covers.
+    #[must_use]
+    pub fn span(&self) -> Span {
+        self.span
+    }
+
+    /// The injected tree, for a self-injection; `None` for another language
+    /// or an editor-resolved injection (and for one nested more than 16
+    /// levels deep, which a warning reports).
+    #[must_use]
+    pub fn tree(&self) -> Option<&Node<Kind>> {
+        self.tree.as_ref()
+    }
+
+    /// Whether the sketch leaves this injection to editors
+    /// (`resolve = "editor"`).
+    #[must_use]
+    pub fn is_editor(&self) -> bool {
+        self.editor
     }
 }

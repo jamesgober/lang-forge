@@ -169,7 +169,12 @@ fn test_forge_errors_render_with_diag_lang() {
     let mut map = SourceMap::new();
     map.add("t.lsf", schematic).expect("fits");
     let text = Renderer::new().render(&err.diagnostics()[0], &map);
-    assert!(text.contains("error: undefined rule `stmt`"), "{text}");
+    // 2.0: every diagnostic carries a code, which the renderer shows in the
+    // header (LSF2 §1.7, which applies to format-1 sketches too).
+    assert!(
+        text.contains("error[LSF4101]: undefined rule `stmt`"),
+        "{text}"
+    );
     assert!(text.contains("t.lsf:4:12"), "{text}");
     assert!(text.contains("help: did you mean `stmts`?"), "{text}");
 }

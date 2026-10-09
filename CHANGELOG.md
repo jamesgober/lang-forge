@@ -13,6 +13,179 @@
 
 ---
 
+## [2.0.0-alpha.1] - 2026-10-09
+
+The first pre-release of 2.0: LSF2, LexerSketch's format-2 sketch syntax, as
+the front end for the Mox demo (ROADMAP work package 2.1). A format-1
+schematic — no `[sketch]` table, or `[sketch] format = 1` — forges and parses
+exactly as in 1.x: the format-1 reader is unchanged and the whole 1.x test
+suite runs against it. The format-2 surface may still change before 2.0.0.
+
+### Breaking
+
+- **Diagnostics carry codes.** Every diagnostic lang-forge produces, in both
+  formats, now has a `diag_lang::Code`: `LSF` codes for sketches, `LF0001`–
+  `LF0014` for lexical errors and `LF1000`–`LF1004` for parse errors in
+  source (diag-lang's phase ranges), `LF9001` for a source over 4 GiB.
+  `diag-lang`'s renderer shows the code in the header: `error[LF1000]:
+  expected `)`, found `;`` where 1.x rendered `error: expected `)`, found
+  `;``. The messages themselves and `Error`'s `Display` are unchanged.
+- **`Kind` is four bytes** (it was two) and, in format-2 trees, carries the
+  field label of the edge from its parent. `PartialEq`, `Eq`, `PartialOrd`,
+  `Ord`, and `Hash` ignore the label, so a labelled `IDENT` equals
+  `lang.kind("IDENT")` and format-1 code behaves as before. They are now
+  implemented by hand rather than derived.
+- **`diag-lang` 1.1** is the minimum (diagnostic codes).
+
+### Migration guide
+
+From 1.x, for a format-1 schematic:
+
+1. Change `lang-forge = "1"` to `lang-forge = "2.0.0-alpha.1"`.
+2. If you match **rendered** diagnostics (`Renderer::render` output), expect
+   the code in the header: `error[LSF4101]: undefined rule …`,
+   `error[LF1000]: expected …`. Matching `Diagnostic::message()` or `Error`'s
+   `Display` needs no change. To branch on the kind of problem, use the code:
+   `d.code().is_some_and(|c| c.number() < 1000)` is "a lexical error".
+3. Nothing else: the schematic, the trees, and the API you use are the same.
+   If you kept kinds in maps, [`Kind::index`](docs/API.md#kind) and
+   [`Language::kind_count`](docs/API.md#languagekind_count) now allow dense
+   tables instead.
+
+To move a schematic to format 2 (LSF2 §2.3):
+
+1. Add `[sketch]` with `format = 2`.
+2. `[language] name` must be `[a-z][a-z0-9_]*` (put free text in
+   `display_name`), and `version` is required and must be SemVer
+   (`"1.0.0"`, not `"1.0"`).
+3. Rule names must be `_?[a-z][a-z0-9_]*`: all-uppercase names are token
+   classes in format 2.
+4. Forge it. If the overlap check reports `LSF4301` with a witness input, a
+   greedy repetition or optional was silently rejecting valid input under
+   format 1: fix it with a predicate (`(&(',' x) ',' x)*`), or acknowledge an
+   intended case with `[rules.r] allow = ["overlap"]`.
+5. Then use what format 2 adds: label fields (`cond:expr`), declare token
+   classes, modes, and string classes, and make keywords contextual.
+
+### Added
+
+- **Format 2 (LSF2) syntax sections**, read by a new reader beside the
+  untouched format-1 one (DECISIONS D6: the crate's own NOML reader,
+  extended):
+  - `[sketch]`: `format`, `kind`, `modules`, `[sketch.checks]` (`overlap`,
+    `unused_rule`, `unused_token`, `unmapped_node`).
+  - `[language]`: format-2 tightenings, `display_name`, `description`,
+    `edition`, `shebang_names`, `files` (per-extension mode and start rule).
+  - `[lexer.tokens]`: custom token classes from regexes or fixed texts, with
+    `trivia`, `priority`, `modes`, `action` (`push`/`pop`/`switch`),
+    `followed_by`/`not_followed_by`, `when_prev`/`unless_prev`,
+    `line_start`/`indented`, and `column`. The regex engine (UTF-8
+    character classes, `\p{XID_Start}`/`\p{XID_Continue}`, bounded
+    repetition, DFA per class with an automaton budget) is reimplemented in
+    the crate from grammar-lang's construction rather than depended on:
+    grammar-lang's lexer DFA works on bytes for its own token model, and
+    lang-forge needs character-class alphabets, conditions, longest match
+    across modes, and its own budgets and image encoding.
+  - Lexer **modes** with a mode stack (`initial_mode`, `max_mode_depth`,
+    `[lexer.modes.m]` with `inherit`, `literals`, `builtins`, `trivia`,
+    `tokens`, `strings`, `text` fallback classes, `actions`, `eof`).
+  - **String classes** `[lexer.strings.NAME]`: delimiters of parts (text,
+    `regex`, `capture`, `backref`, `newline`) for raw strings and heredocs,
+    `interpolate` holes parsed by a rule (with `mode`, `when_next`, and
+    bracket counting), `embedded` tokens (with `parse` self-injection),
+    `escape_tokens`, `body`, `close_at`, `close_not_followed_by`,
+    `multiline`; strings that build nodes get generated, labelled kinds.
+    `escapes` and `dedent` are validated for lower-lang.
+  - **Keywords**: `[lexer.keywords]` `contextual`, `reserved`,
+    `default = "contextual"`, `case = "ascii-insensitive"`; contextual
+    keywords work as Pratt operators too.
+  - `[lexer.numbers]` (radixes, separators and their rule, floats,
+    exponents, leading and trailing dots, hex floats, leading zeros,
+    suffixes), comment tables (`doc`, `not_followed_by`, `stop_before`,
+    `nested`, `modes`), the identifier table (`extra_start`,
+    `extra_continue`, `normalize`), `shebang`, `brackets`, and
+    `[lexer.columns] tab_width`.
+  - `[layout]`: the offside rule (`INDENT`/`DEDENT`), `open_after`,
+    `implicit_join`, `explicit_join`, `tabs`, and `[layout.newlines]` modes
+    (`trivia`, `significant`, `terminators` with `terminate_after` and
+    `continue_before`, `ignored_inside`).
+  - The rule language, version 2: **field labels** (`name:element`, on
+    tokens, nodes, and groups), predicates `&e` and `!e`, text
+    back-references `IDENT=label`, `WORD`, `EOF`, `LINE_START`,
+    `NL_BEFORE`, `INDENT`, `DEDENT`; table rules with `sync`, `allow`, and
+    `doc`; `prec` on expression-rule levels.
+  - `[injections]` (self-injections parsed, others listed as ranges),
+    `[hooks]` (validated), and `[ast]` supertypes.
+- **Field labels on tree edges** (ISSUES P16): stored in each child's `Kind`,
+  so every format-2 tree carries them. `Language::field_label` has the shape
+  of lower-lang 0.3's `Labeler::label`; `Language::fields` (with `Field` and
+  `Cardinality`) derives each node kind's fields; `label_name` and
+  `label_id`. Pratt operator nodes are labelled `lhs`/`op`/`rhs` and
+  `op`/`operand`.
+- **The overlap check** (ISSUES M02, `LSF4301`): an LL(2) check that refuses
+  a greedy repetition or optional committing on a token after which its
+  body and its follower diverge, with a witness input. Format 2 only, so
+  format 1 is unchanged.
+- **A public kind index** (ISSUES M04): `Kind::index`, `Language::kind_count`,
+  `kind_at`, and `root_kind`; format-2 kinds are numbered as LSF2 §5.4
+  prescribes.
+- **Language images** (ISSUES M12): `Language::to_image` and
+  `Language::from_image`, `ImageError`, `IMAGE_FORMAT`. Deterministic bytes;
+  untrusted input fully validated before use.
+- **Multi-file sketches** (ISSUES M13): `Sketch` and
+  `Language::from_sketch`, with diagnostics located through a `SourceMap`
+  and portable, normalized paths.
+- **Diagnostic codes** (ISSUES P19, P04), in diag-lang 1.1's ranges.
+- `Language::format`, `display_name`, `description`, `edition`,
+  `shebang_names`, `supertype`, `supertypes`, `warnings`, `parse_file`;
+  `Parse::injections` and `Injection`.
+- Examples: `template` (a format-2 template renderer that walks the tree by
+  field name and renders again from the language's image) with
+  `examples/schematics/tmpl.lsf`.
+- Tests: format-2 lexer and grammar suites, the Mox sketch with
+  representative scripts and templates, multi-file sketches, images
+  (including property tests over mutated images), format-2 parser
+  properties (strict and memo agreement, labels included), and format-2
+  regressions; benches for forging Mox, its image, and lexing and parsing
+  Mox scripts and templates.
+
+### Fixed
+
+- **ISSUES P09:** a rule remembered by the memo at a shallow depth was
+  replayed where parsing it would pass the depth limit, so memoized and
+  unmemoized parsing could disagree near the limit. Memo entries now record
+  how deep they went and are replayed only within the limit.
+- **ISSUES P10:** the left-recursion check walked from every rule (quadratic
+  on long rule chains) and suggestions ran an edit distance per pair of
+  names. Left recursion is now found with one strongly-connected-components
+  pass, and suggestions use a banded edit distance under one budget shared
+  by the whole report. A 5000-rule left-recursive cycle and 3000 undefined
+  names against 3000 rules each forge (and are refused) in well under a
+  second.
+
+### Notes
+
+- Mox's sketch (`_lexersketch/sketches/mox.lsf`) has one more divergence
+  than it acknowledges: `elseif_clause`'s optional `else:` (the same case as
+  `if_stmt`, which says `allow = ["overlap"]`). The test copy in
+  `tests/sketches/mox.lsf` adds the same allowance; the flagship sketch
+  needs it too.
+- Not in this alpha, and refused with `LSF1007` rather than ignored: sketch
+  composition (`extends`, `[compose]`, mixins), `[lexer.split]`,
+  `[lexer.columns] trivia`, scanner/layout/predicate hooks, `%mode(...)`,
+  rule-scoped `newlines`, `soft_terminators`, `dynamic` operators,
+  `rest_of_line = "code"`, injection `when`, and combined self-injections.
+  Each is scheduled for alpha.2 in `dev/ROADMAP.md` with its reason.
+- Performance against 1.0.1, run back to back: lexing and parsing valid
+  format-1 input are within noise; forging is up to about 1 µs (0–10 %)
+  slower on the example schematics, a 100,000-operand operator chain 6–12 %,
+  and error-heavy input 10–19 % (every diagnostic carries a code). Parser
+  events stay 8 bytes despite the four-byte `Kind` (packed), which keeps
+  speculation at 1.x speed. The format-2 scanner is about five times slower
+  per byte than format 1's derived lexer. Figures in the release notes.
+
+---
+
 ## [1.0.1] - 2026-10-08
 
 A hardening patch from the LexerSketch audit. No public API changes; the
@@ -217,7 +390,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/lang-forge/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/jamesgober/lang-forge/compare/v2.0.0-alpha.1...HEAD
+[2.0.0-alpha.1]: https://github.com/jamesgober/lang-forge/compare/v1.0.1...v2.0.0-alpha.1
 [1.0.1]: https://github.com/jamesgober/lang-forge/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jamesgober/lang-forge/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/jamesgober/lang-forge/compare/v0.1.0...v0.2.0

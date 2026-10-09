@@ -194,3 +194,22 @@ mod tests {
         assert!(sets.contains(a, 0));
     }
 }
+
+crate::image::image_struct!(Sets { width, words });
+
+impl Sets {
+    /// The number of sets.
+    pub(crate) fn count(&self) -> usize {
+        self.words.len() / self.width.max(1)
+    }
+
+    /// The number of bits each set holds.
+    pub(crate) fn bits(&self) -> usize {
+        self.width * 64
+    }
+
+    /// Whether the arena is well formed.
+    pub(crate) fn valid(&self) -> bool {
+        self.width >= 1 && self.words.len() % self.width == 0
+    }
+}

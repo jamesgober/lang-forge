@@ -19,10 +19,12 @@
 //! number, date, or time must be well formed even though no schematic
 //! setting takes one. A leading byte-order mark is skipped.
 
-use alloc::{borrow::Cow, collections::BTreeMap, format, string::String, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, format, string::String, vec::Vec};
 
-use diag_lang::{Diagnostic, Label, Severity};
+use diag_lang::{Code, Diagnostic, Label, Severity};
 use syntax_lang::Span;
+
+use crate::codes;
 
 /// How deeply a schematic may nest, counting every level together: each part
 /// of a `[header]` or dotted key, each array, and each inline table. Real
@@ -105,9 +107,10 @@ pub(crate) struct Value<'s> {
 pub(crate) enum ValueKind<'s> {
     Str(Text<'s>),
     Bool(bool),
-    /// A number, checked but not kept: no schematic setting takes one, so it
-    /// is only ever reported as the wrong type.
-    Number,
+    /// A number. Integers that fit an `i64` keep their value (format-2 keys
+    /// take integers); floats, `inf`, `nan`, and out-of-range integers are
+    /// checked but not kept, and only ever reported as the wrong type.
+    Number(Option<i64>),
     /// A TOML date, time, or date-time; like a number, never a valid setting.
     DateTime,
     Array(Vec<Value<'s>>),
@@ -123,6 +126,9 @@ pub(crate) struct Text<'s> {
     /// Whether `text` is exactly the source at `start`, so an offset into
     /// `text` plus `start` is an offset into the schematic.
     pub(crate) exact: bool,
+    /// Whether it was written as a multi-line (`"""` or `'''`) string, whose
+    /// CRLF line breaks a format-2 sketch reads as LF (LSF2 §1.4).
+    pub(crate) multiline: bool,
 }
 
 impl Text<'_> {
@@ -150,7 +156,7 @@ impl ValueKind<'_> {
         match self {
             ValueKind::Str(_) => "a string",
             ValueKind::Bool(_) => "a boolean",
-            ValueKind::Number => "a number",
+            ValueKind::Number(_) => "a number",
             ValueKind::DateTime => "a date or time",
             ValueKind::Array(_) => "an array",
             ValueKind::Table(_) => "a table",
@@ -159,9 +165,10 @@ impl ValueKind<'_> {
 }
 
 /// Reads a schematic into its root table.
-pub(crate) fn read(text: &str) -> Result<Table<'_>, Diagnostic> {
+pub(crate) fn read(text: &str) -> Result<Table<'_>> {
     if text.len() > MAX_SCHEMATIC {
-        return Err(error(
+        return fail(coded(
+            codes::DOCUMENT_TOO_LARGE,
             Span::empty(0),
             format!("the schematic is larger than {} MiB", MAX_SCHEMATIC >> 20),
         ));
@@ -178,7 +185,11 @@ pub(crate) fn read(text: &str) -> Result<Table<'_>, Diagnostic> {
 }
 
 fn error(span: Span, message: impl Into<alloc::boxed::Box<str>>) -> Diagnostic {
-    Diagnostic::new(Severity::Error, message, Label::unlabelled(span))
+    coded(codes::NOML_INVALID, span, message)
+}
+
+fn coded(code: Code, span: Span, message: impl Into<alloc::boxed::Box<str>>) -> Diagnostic {
+    Diagnostic::new(Severity::Error, message, Label::unlabelled(span)).with_code(code)
 }
 
 struct Reader<'s> {
@@ -191,7 +202,15 @@ struct Reader<'s> {
     depth: u32,
 }
 
-type Result<T, E = Diagnostic> = core::result::Result<T, E>;
+/// The reader stops at the first problem, so an error is one diagnostic,
+/// boxed: every `Ok` the reader returns stays small.
+pub(crate) type Result<T, E = Box<Diagnostic>> = core::result::Result<T, E>;
+
+/// Fails with `diagnostic`.
+#[cold]
+fn fail<T>(diagnostic: Diagnostic) -> Result<T> {
+    Err(Box::new(diagnostic))
+}
 
 /// A dotted key: each part and its span.
 type Keys<'s> = Vec<(Cow<'s, str>, Span)>;
@@ -228,7 +247,8 @@ impl<'s> Reader<'s> {
         let open = self.pos;
         self.pos += 1;
         if self.peek() == Some(b'[') {
-            return Err(error(
+            return fail(coded(
+                codes::NOML_FEATURE,
                 self.span_from(open),
                 "arrays of tables (`[[...]]`) are not used in a schematic",
             ));
@@ -237,7 +257,7 @@ impl<'s> Reader<'s> {
         let keys = self.key_path()?;
         self.skip_spaces();
         if self.peek() != Some(b']') {
-            return Err(self.unexpected("`]` to close the table header"));
+            return fail(self.unexpected("`]` to close the table header"));
         }
         self.pos += 1;
         let span = self.span_from(open);
@@ -264,13 +284,13 @@ impl<'s> Reader<'s> {
             };
             let entry = &mut table.entries[index];
             let ValueKind::Table(child) = &mut entry.value.kind else {
-                return Err(error(
+                return fail(error(
                     key_span,
                     format!("`{}` is already defined as a value", entry.key),
                 ));
             };
             if child.sealed {
-                return Err(error(
+                return fail(error(
                     key_span,
                     format!("`{}` is an inline table and cannot be extended", entry.key),
                 ));
@@ -278,12 +298,12 @@ impl<'s> Reader<'s> {
             if last {
                 let name = self.src[open + 1..span.end().to_usize() - 1].trim();
                 if child.explicit {
-                    return Err(error(span, format!("table [{name}] is defined twice")));
+                    return fail(error(span, format!("table [{name}] is defined twice")));
                 }
                 // TOML: dotted keys define their tables; a header may add
                 // sub-tables to one, but not define it again.
                 if child.dotted {
-                    return Err(error(
+                    return fail(error(
                         span,
                         format!("table [{name}] is already defined by dotted keys"),
                     ));
@@ -307,11 +327,11 @@ impl<'s> Reader<'s> {
         let inner = outer + keys.len() as u32 - 1;
         if inner > MAX_NESTING {
             let (_, last) = keys[keys.len() - 1];
-            return Err(too_deep(last));
+            return fail(too_deep(last));
         }
         self.skip_spaces();
         if self.peek() != Some(b'=') {
-            return Err(self.unexpected("`=` after the key"));
+            return fail(self.unexpected("`=` after the key"));
         }
         self.pos += 1;
         self.skip_spaces();
@@ -329,7 +349,8 @@ impl<'s> Reader<'s> {
             // Every part is a level of table nesting; like arrays and inline
             // tables, a dotted key or header may not nest without limit.
             if keys.len() >= MAX_NESTING as usize {
-                return Err(error(
+                return fail(coded(
+                    codes::TOO_DEEP,
                     key.1,
                     format!("a dotted key has more than {MAX_NESTING} parts"),
                 ));
@@ -351,7 +372,7 @@ impl<'s> Reader<'s> {
         match self.peek() {
             Some(quote @ (b'"' | b'\'')) => {
                 if self.bytes[start..].starts_with(&[quote; 3]) {
-                    return Err(error(
+                    return fail(error(
                         Span::new(start as u32, start as u32 + 3),
                         "a key cannot be a multi-line string",
                     ));
@@ -368,7 +389,7 @@ impl<'s> Reader<'s> {
                     self.span_from(start),
                 ))
             }
-            _ => Err(self.unexpected("a key")),
+            _ => fail(self.unexpected("a key")),
         }
     }
 
@@ -379,7 +400,8 @@ impl<'s> Reader<'s> {
             Some(b'[') => ValueKind::Array(self.nested(Self::array)?),
             Some(b'{') => ValueKind::Table(self.nested(Self::inline_table)?),
             Some(b'@') => {
-                return Err(error(
+                return fail(coded(
+                    codes::NOML_FEATURE,
                     self.word_span(),
                     "NOML native types (`@...`) are not allowed in a schematic",
                 ));
@@ -392,21 +414,22 @@ impl<'s> Reader<'s> {
                 match word {
                     "true" => ValueKind::Bool(true),
                     "false" => ValueKind::Bool(false),
-                    "inf" | "nan" => ValueKind::Number,
+                    "inf" | "nan" => ValueKind::Number(None),
                     _ if self.peek() == Some(b'(') => {
-                        return Err(Diagnostic::new(
+                        return fail(Diagnostic::new(
                             Severity::Error,
                             format!("NOML function calls such as `{word}(...)` are not allowed in a schematic"),
                             Label::unlabelled(span),
                         )
-                        .with_note("a schematic must forge the same language on every machine"));
+                        .with_note("a schematic must forge the same language on every machine")
+                        .with_code(codes::NOML_FEATURE));
                     }
                     _ => {
-                        return Err(error(span, format!("expected a value, found `{word}`")));
+                        return fail(error(span, format!("expected a value, found `{word}`")));
                     }
                 }
             }
-            _ => return Err(self.unexpected("a value")),
+            _ => return fail(self.unexpected("a value")),
         };
         Ok(Value {
             kind,
@@ -443,7 +466,7 @@ impl<'s> Reader<'s> {
         self.pos = end;
         let text = &self.src[start..end];
         if is_number(text) {
-            return Ok(ValueKind::Number);
+            return Ok(ValueKind::Number(integer(text)));
         }
         if is_date_time(text) {
             return Ok(ValueKind::DateTime);
@@ -456,7 +479,7 @@ impl<'s> Reader<'s> {
         } else {
             "number"
         };
-        Err(error(
+        fail(error(
             self.span_from(start),
             format!("invalid {what} `{text}`"),
         ))
@@ -465,7 +488,7 @@ impl<'s> Reader<'s> {
     /// Runs `parse` one nesting level deeper, refusing to go past the limit.
     fn nested<T>(&mut self, parse: fn(&mut Self) -> Result<T>) -> Result<T> {
         if self.depth >= MAX_NESTING {
-            return Err(too_deep(Span::new(self.pos as u32, self.pos as u32 + 1)));
+            return fail(too_deep(Span::new(self.pos as u32, self.pos as u32 + 1)));
         }
         self.depth += 1;
         let result = parse(self);
@@ -487,7 +510,7 @@ impl<'s> Reader<'s> {
             match self.peek() {
                 Some(b',') => self.pos += 1,
                 Some(b']') => {}
-                _ => return Err(self.unexpected("`,` or `]` in the array")),
+                _ => return fail(self.unexpected("`,` or `]` in the array")),
             }
         }
     }
@@ -510,7 +533,7 @@ impl<'s> Reader<'s> {
             match self.peek() {
                 Some(b',') => self.pos += 1,
                 Some(b'}') => {}
-                _ => return Err(self.unexpected("`,` or `}` in the inline table")),
+                _ => return fail(self.unexpected("`,` or `}` in the inline table")),
             }
         }
     }
@@ -540,13 +563,13 @@ impl<'s> Reader<'s> {
         loop {
             let at = self.pos;
             let Some(b) = self.peek() else {
-                return Err(unterminated());
+                return fail(unterminated());
             };
             if b == quote {
                 if !triple {
                     let text = finish(self.src, owned, run, at);
                     self.pos += 1;
-                    return Ok(self.text(text, start));
+                    return Ok(self.text(text, start, false));
                 }
                 if self.bytes[at..].starts_with(&[quote; 3]) {
                     // Up to two quotes may sit right before the closing three.
@@ -558,7 +581,7 @@ impl<'s> Reader<'s> {
                     let end = at + extra;
                     let text = finish(self.src, owned, run, end);
                     self.pos = end + 3;
-                    return Ok(self.text(text, start));
+                    return Ok(self.text(text, start, true));
                 }
                 self.pos += 1;
                 continue;
@@ -570,15 +593,15 @@ impl<'s> Reader<'s> {
                     self.escape(buf, triple, delimiter)?;
                     run = self.pos;
                 }
-                b'\n' if !triple => return Err(unterminated()),
+                b'\n' if !triple => return fail(unterminated()),
                 b'\r' if !triple && self.bytes.get(at + 1) == Some(&b'\n') => {
-                    return Err(unterminated());
+                    return fail(unterminated());
                 }
                 b'\r' if triple && self.bytes.get(at + 1) == Some(&b'\n') => self.pos += 2,
                 b'\t' => self.pos += 1,
                 b'\n' => self.pos += 1,
                 0..=0x1f | 0x7f => {
-                    return Err(error(
+                    return fail(error(
                         Span::new(at as u32, at as u32 + 1),
                         "control characters must be escaped in a string",
                     ));
@@ -588,11 +611,12 @@ impl<'s> Reader<'s> {
         }
     }
 
-    fn text(&self, text: (Cow<'s, str>, bool), start: usize) -> Text<'s> {
+    fn text(&self, text: (Cow<'s, str>, bool), start: usize, multiline: bool) -> Text<'s> {
         Text {
             text: text.0,
             start: start as u32,
             exact: text.1,
+            multiline,
         }
     }
 
@@ -601,7 +625,7 @@ impl<'s> Reader<'s> {
         let at = self.pos;
         self.pos += 1; // `\`
         let Some(code) = self.peek() else {
-            return Err(error(delimiter, "unterminated string"));
+            return fail(error(delimiter, "unterminated string"));
         };
         self.pos += 1;
         let ch = match code {
@@ -621,7 +645,7 @@ impl<'s> Reader<'s> {
                     .flatten()
                     .and_then(char::from_u32);
                 let Some(ch) = ch else {
-                    return Err(error(
+                    return fail(error(
                         Span::new(at as u32, (self.pos + digits.len()) as u32),
                         "invalid Unicode escape",
                     ));
@@ -641,7 +665,7 @@ impl<'s> Reader<'s> {
                         .all(|b| matches!(b, b' ' | b'\t' | b'\r'))
                 });
                 if !only_space {
-                    return Err(error(self.span_from(at), "invalid escape"));
+                    return fail(error(self.span_from(at), "invalid escape"));
                 }
                 while self
                     .peek()
@@ -654,7 +678,7 @@ impl<'s> Reader<'s> {
             _ => {
                 // Span the whole escaped character, which may be multi-byte.
                 let width = self.src[at + 1..].chars().next().map_or(1, char::len_utf8);
-                return Err(error(
+                return fail(error(
                     Span::new(at as u32, (at + 1 + width) as u32),
                     "invalid escape",
                 ));
@@ -698,7 +722,7 @@ impl<'s> Reader<'s> {
                 self.skip_comment();
                 Ok(())
             }
-            _ => Err(self.unexpected("the end of the line")),
+            _ => fail(self.unexpected("the end of the line")),
         }
     }
 
@@ -744,6 +768,78 @@ impl<'s> Reader<'s> {
     }
 }
 
+impl Text<'_> {
+    /// Rewrites the CRLF line breaks of a multi-line string to LF, as a
+    /// format-2 sketch reads them (LSF2 §1.4). Offsets into a rewritten text
+    /// no longer map onto the source one-to-one, so it stops being exact.
+    pub(crate) fn normalize_line_breaks(&mut self) {
+        if self.multiline && self.text.contains("\r\n") {
+            self.text = Cow::Owned(self.text.replace("\r\n", "\n"));
+            self.exact = false;
+        }
+    }
+}
+
+impl Table<'_> {
+    /// Moves every span by `base` bytes and normalizes multi-line strings: a
+    /// format-2 document's values as a multi-file sketch's later stages want
+    /// them, with spans in the sketch's source map. Recursion is bounded by
+    /// the 64-level nesting limit.
+    pub(crate) fn rebase(&mut self, base: u32) {
+        let shift =
+            |span: Span| Span::new(span.start().to_u32() + base, span.end().to_u32() + base);
+        self.span = shift(self.span);
+        for entry in &mut self.entries {
+            entry.key_span = shift(entry.key_span);
+            entry.value.rebase(base);
+        }
+    }
+}
+
+impl<'s> Table<'s> {
+    /// Merges `other` (a later file of the same sketch) into this table, as
+    /// if the files were one document whose repeated headers may add keys
+    /// (LSF2 §3.2): tables defined in both merge key by key; a key defined in
+    /// both, or a table defined in one and a value in the other, is reported
+    /// to `twice` with both places and keeps the first.
+    pub(crate) fn merge(&mut self, other: Table<'s>, twice: &mut dyn FnMut(&str, Span, Span)) {
+        // Recursion is bounded by the 64-level nesting limit.
+        for entry in other.entries {
+            let Some(index) = self.find(&entry.key) else {
+                let _ = self.push(entry);
+                continue;
+            };
+            let existing = &mut self.entries[index];
+            match (&mut existing.value.kind, entry.value.kind) {
+                (ValueKind::Table(mine), ValueKind::Table(theirs))
+                    if !mine.sealed && !theirs.sealed =>
+                {
+                    mine.merge(theirs, twice);
+                }
+                _ => twice(&entry.key, existing.key_span, entry.key_span),
+            }
+        }
+    }
+}
+
+impl Value<'_> {
+    fn rebase(&mut self, base: u32) {
+        self.span = Span::new(
+            self.span.start().to_u32() + base,
+            self.span.end().to_u32() + base,
+        );
+        match &mut self.kind {
+            ValueKind::Str(text) => {
+                text.start += base;
+                text.normalize_line_breaks();
+            }
+            ValueKind::Array(items) => items.iter_mut().for_each(|v| v.rebase(base)),
+            ValueKind::Table(table) => table.rebase(base),
+            ValueKind::Bool(_) | ValueKind::Number(_) | ValueKind::DateTime => {}
+        }
+    }
+}
+
 /// Completes a string: borrowed when nothing was copied, owned otherwise.
 fn finish(src: &str, owned: Option<String>, run: usize, end: usize) -> (Cow<'_, str>, bool) {
     match owned {
@@ -760,7 +856,8 @@ fn is_bare_key(b: u8) -> bool {
 }
 
 fn too_deep(span: Span) -> Diagnostic {
-    error(
+    coded(
+        codes::TOO_DEEP,
         span,
         format!("the schematic nests more than {MAX_NESTING} levels deep"),
     )
@@ -807,6 +904,39 @@ fn is_number(text: &str) -> bool {
         && (int == "0" || !int.starts_with('0'))
         && fraction.is_none_or(|f| is_digits(f, 10))
         && exponent.is_none_or(|e| is_digits(e.strip_prefix(['+', '-']).unwrap_or(e), 10))
+}
+
+/// The value of a TOML integer (`is_number` already accepted it), or `None`
+/// for a float, `inf`, `nan`, or an integer outside `i64`.
+fn integer(text: &str) -> Option<i64> {
+    let (negative, body) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (digits, radix) = if let Some(d) = body.strip_prefix("0x") {
+        (d, 16)
+    } else if let Some(d) = body.strip_prefix("0o") {
+        (d, 8)
+    } else if let Some(d) = body.strip_prefix("0b") {
+        (d, 2)
+    } else {
+        (body, 10)
+    };
+    if radix == 10 && digits.contains(['.', 'e', 'E', 'i', 'n']) {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for b in digits.bytes().filter(|b| *b != b'_') {
+        let digit = char::from(b).to_digit(radix)?;
+        value = value.checked_mul(i64::from(radix))?;
+        value = if negative {
+            value.checked_sub(i64::from(digit))?
+        } else {
+            value.checked_add(i64::from(digit))?
+        };
+    }
+    Some(value)
 }
 
 /// Whether `text` is a TOML local date, `YYYY-MM-DD`, of a real day.
@@ -924,12 +1054,15 @@ fn insert<'s>(table: &mut Table<'s>, keys: Keys<'s>, value: Value<'s>) -> Result
         if i + 1 == count {
             if let Some(index) = existing {
                 let first = table.entries[index].key_span;
-                return Err(Diagnostic::new(
-                    Severity::Error,
-                    format!("`{key}` is defined twice"),
-                    Label::new(key_span, "defined again here"),
-                )
-                .with_secondary(Label::new(first, "first defined here")));
+                return fail(
+                    Diagnostic::new(
+                        Severity::Error,
+                        format!("`{key}` is defined twice"),
+                        Label::new(key_span, "defined again here"),
+                    )
+                    .with_secondary(Label::new(first, "first defined here"))
+                    .with_code(codes::NOML_INVALID),
+                );
             }
             let _ = table.push(Entry {
                 key,
@@ -959,7 +1092,7 @@ fn insert<'s>(table: &mut Table<'s>, keys: Keys<'s>, value: Value<'s>) -> Result
                 table = child;
             }
             _ => {
-                return Err(error(
+                return fail(error(
                     key_span,
                     format!(
                         "`{}` is already defined and cannot be extended with a dotted key",
@@ -1066,7 +1199,11 @@ mod tests {
     #[test]
     fn test_read_numbers_are_recognized() {
         let doc = read("a = 1_000\nb = -2.5e3\n").unwrap();
-        assert!(matches!(doc.entries[0].value.kind, ValueKind::Number));
+        assert!(matches!(
+            doc.entries[0].value.kind,
+            ValueKind::Number(Some(1000))
+        ));
+        assert!(matches!(doc.entries[1].value.kind, ValueKind::Number(None)));
         assert_eq!(doc.entries[1].value.type_name(), "a number");
     }
 
@@ -1308,7 +1445,7 @@ mod tests {
             let text = format!("a = {n}\n");
             let doc = read(&text).unwrap_or_else(|e| panic!("{n}: {e:?}"));
             assert!(
-                matches!(doc.entries[0].value.kind, ValueKind::Number),
+                matches!(doc.entries[0].value.kind, ValueKind::Number(_)),
                 "{n}"
             );
         }

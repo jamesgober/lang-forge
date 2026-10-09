@@ -1,0 +1,1141 @@
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+#  Mox — the PHP killer · LexerSketch flagship · paper sketch (ROADMAP 1.8)
+#
+#  Written against specs/LSF2.md (format 2), 2026-10-08, before the forge supports format 2.
+#  lang-forge test copy (2026-10-09): `elseif_clause` moved to table form with `allow = ["overlap"]`
+#  (the only change; see tests/mox.rs).
+#  Design source: LANGUAGES.md "Mox". Where the owner has not decided something, this sketch makes a
+#  documented choice and marks it  [OQ-n]  (owner question n, listed at the end of this file and in
+#  sketches/README.md). Constructs this sketch can describe but that LexerSketch's consumers cannot
+#  lower yet are routed to the `mox_lower` hook or a pending key, and listed under GAPS at the end.
+#
+#  Shape of the language:
+#    · A .mox file is text with code islands: `<?mox … ?>` and `<?= expr ?>` (template mode).
+#    · Inside islands: PHP 8.x syntax — $variables, PHP operators and precedence, "…{$x}…"
+#      interpolation, heredoc/nowdoc, functions, closures (use, fn =>), classes, interfaces, traits
+#      (insteadof/as), enums, attributes #[…], PHP arrays, exceptions, foreach, match, generators.
+#    · Additions over PHP: async/await/spawn tasks (contextual keywords, so PHP code that uses those
+#      names as functions keeps working).
+#    · Runtime: dynamic values, PHP integer overflow promotion to float, copy-on-write ordered-map
+#      arrays, reference counting + cycle collection, request-scoped arenas, async tasks.
+#    · Execution: interpreter (default), JIT, AOT, and the hybrid publish mode.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+[sketch]
+format = 2
+
+[sketch.checks]
+overlap       = "deny"    # every list with an optional trailing comma uses the predicate idiom below
+unused_rule   = "warn"
+unused_token  = "warn"
+unmapped_node = "warn"
+
+[language]
+name          = "mox"
+display_name  = "Mox"
+description   = "A modern PHP: template islands, PHP syntax, dynamic values, request arenas, interpreted, JIT, AOT and hybrid."
+version       = "0.1.0"
+edition       = "1"
+extensions    = ["mox"]          # [OQ-2] a second, code-first extension (no `<?mox` needed)?
+start         = "file"
+shebang_names = ["mox"]
+
+# ───────────────────────────────────────────── lexer ─────────────────────────────────────────────
+
+[lexer]
+identifiers     = { style = "xid", normalize = "require-nfc", confusables = "warn" }
+initial_mode    = "template"     # a file starts as text, like PHP
+shebang         = true           # `#!/usr/bin/env mox` on line 1 (CLI scripts)
+brackets        = [["(", ")"], ["[", "]"], ["{", "}"]]
+nested_comments = false
+line_comments   = [
+    # PHP: a `?>` ends the code island even inside a single-line comment.
+    { open = "//", stop_before = ["?>"] },
+    # `#` comments, except `#[` which opens an attribute (PHP 8).
+    { open = "#", not_followed_by = '\[', stop_before = ["?>"] },
+]
+block_comments  = [
+    { open = "/**", close = "*/", doc = true, not_followed_by = "/" },   # `/**/` stays an ordinary comment
+    ["/*", "*/"],
+]
+
+[lexer.keywords]
+default    = "reserved"
+case       = "sensitive"   # [OQ-1] PHP keywords are case-insensitive; Mox is lowercase-only (the porter rewrites)
+# Contextual: Mox's additions plus PHP's own soft keywords, so `function spawn()` and `$x->enum` still work.
+contextual = ["async", "await", "spawn", "enum", "readonly", "from"]
+# Reserved but not supported, so that no program can start depending on them as names.
+reserved   = ["goto", "eval", "__halt_compiler", "var"]   # [OQ-7] dropped PHP features
+
+[lexer.numbers]
+radix         = ["0x", "0o", "0b"]
+radix_case    = "any"          # PHP accepts 0X, 0O, 0B
+separators    = "_"            # PHP 7.4
+separator_rule = "between-digits"
+floats        = true
+exponent      = true
+leading_dot   = true           # .5
+trailing_dot  = true           # 1.   (so `1.$x` lexes as `1.` `$x`, exactly as in PHP; LSF3120 warns)
+leading_zeros = "error"        # [OQ-6] PHP's 0755 is octal; Mox requires 0o755
+
+# Single-quoted: only \\ and \' are escapes.
+[lexer.strings.SQ_STRING]
+open      = "'"
+escape    = "\\"
+escapes   = "quotes"
+multiline = true
+
+# Double-quoted: PHP escapes, `{$expr}` holes, and PHP's simple interpolation `$a`, `$a[0]`, `$o->p`.
+[lexer.strings.DQ_STRING]
+open      = '"'
+escape    = "\\"
+multiline = true
+escapes   = { simple = { n = "\n", t = "\t", r = "\r", v = "\u000B", e = "\u001B", f = "\u000C", "\\" = "\\", "$" = "$", '"' = '"' }, octal = 3, hex = { prefix = "x", min = 1, max = 2 }, unicode = { open = "u{", close = "}" }, unknown = "keep", bytes = true }
+interpolate = [
+    { open = "{", when_next = '\$', close = "}", rule = "expr" },          # "{$a->b['c']}"
+]                                                                          # [OQ-8] PHP's "${name}" is not supported
+embedded = [
+    { token = "DQ_VAR", regex = '\$[\p{XID_Start}_]\p{XID_Continue}*(\[(-?[0-9]+|[\p{XID_Start}_]\p{XID_Continue}*|\$[\p{XID_Start}_]\p{XID_Continue}*)\]|->[\p{XID_Start}_]\p{XID_Continue}*)?', parse = "simple_interp" },
+]
+
+# Heredoc  <<<EOT … EOT  (PHP 7.3 flexible: the closing marker may be indented; that indentation is removed).
+[lexer.strings.HEREDOC]
+open      = ["<<<", { regex = '[ \t]*' }, { capture = '[\p{XID_Start}_]\p{XID_Continue}*' }, { newline = true }]
+close     = [{ backref = true }]
+close_at  = "line-start-indented"
+close_not_followed_by = '\p{XID_Continue}'
+dedent    = "closing-indent"
+escape    = "\\"
+escapes   = { simple = { n = "\n", t = "\t", r = "\r", v = "\u000B", e = "\u001B", f = "\u000C", "\\" = "\\", "$" = "$" }, octal = 3, hex = { prefix = "x", min = 1, max = 2 }, unicode = { open = "u{", close = "}" }, unknown = "keep", bytes = true }
+multiline = true
+interpolate = [{ open = "{", when_next = '\$', close = "}", rule = "expr" }]
+embedded  = [{ token = "HEREDOC_VAR", regex = '\$[\p{XID_Start}_]\p{XID_Continue}*(\[(-?[0-9]+|[\p{XID_Start}_]\p{XID_Continue}*|\$[\p{XID_Start}_]\p{XID_Continue}*)\]|->[\p{XID_Start}_]\p{XID_Continue}*)?', parse = "simple_interp" }]
+
+# Heredoc with a quoted marker  <<<"EOT"  (same meaning as the bare form).
+[lexer.strings.HEREDOC_Q]
+open      = ["<<<", { regex = '[ \t]*' }, '"', { capture = '[\p{XID_Start}_]\p{XID_Continue}*' }, '"', { newline = true }]
+close     = [{ backref = true }]
+close_at  = "line-start-indented"
+close_not_followed_by = '\p{XID_Continue}'
+dedent    = "closing-indent"
+escape    = "\\"
+escapes   = { simple = { n = "\n", t = "\t", r = "\r", v = "\u000B", e = "\u001B", f = "\u000C", "\\" = "\\", "$" = "$" }, octal = 3, hex = { prefix = "x", min = 1, max = 2 }, unicode = { open = "u{", close = "}" }, unknown = "keep", bytes = true }
+multiline = true
+interpolate = [{ open = "{", when_next = '\$', close = "}", rule = "expr" }]
+embedded  = [{ token = "HEREDOC_Q_VAR", regex = '\$[\p{XID_Start}_]\p{XID_Continue}*(\[(-?[0-9]+|[\p{XID_Start}_]\p{XID_Continue}*|\$[\p{XID_Start}_]\p{XID_Continue}*)\]|->[\p{XID_Start}_]\p{XID_Continue}*)?', parse = "simple_interp" }]
+
+# Nowdoc  <<<'EOT' … EOT  : raw, no escapes, no interpolation.
+[lexer.strings.NOWDOC]
+open      = ["<<<", { regex = '[ \t]*' }, "'", { capture = '[\p{XID_Start}_]\p{XID_Continue}*' }, "'", { newline = true }]
+close     = [{ backref = true }]
+close_at  = "line-start-indented"
+close_not_followed_by = '\p{XID_Continue}'
+dedent    = "closing-indent"
+escape    = ""
+escapes   = "none"
+multiline = true
+
+[lexer.tokens]
+VARIABLE    = { regex = '\$[\p{XID_Start}_]\p{XID_Continue}*', doc = "A variable: `$name`." }
+MAGIC_CONST = { regex = '__(LINE|FILE|DIR|FUNCTION|CLASS|METHOD|NAMESPACE|TRAIT|PROPERTY)__', doc = "A compile-time constant such as `__LINE__`." }
+# Template islands. The open tags exist only in template mode; `?>` (and the one line break after
+# it, as in PHP) switches back to template mode.
+OPEN_TAG    = { literal = "<?mox", modes = ["template"], not_followed_by = '\p{XID_Continue}', action = "switch main" }
+OPEN_ECHO   = { literal = "<?=", modes = ["template"], action = "switch main" }
+CLOSE_TAG   = { regex = '\?>(\r?\n)?', action = "switch template" }
+# PHP casts are single tokens: `(int)`, `( string )`. As in PHP, `f(int)` therefore lexes a cast.
+INT_CAST    = { regex = '\([ \t]*int[ \t]*\)' }
+FLOAT_CAST  = { regex = '\([ \t]*float[ \t]*\)' }
+STRING_CAST = { regex = '\([ \t]*string[ \t]*\)' }
+BOOL_CAST   = { regex = '\([ \t]*bool[ \t]*\)' }
+ARRAY_CAST  = { regex = '\([ \t]*array[ \t]*\)' }
+OBJECT_CAST = { regex = '\([ \t]*object[ \t]*\)' }
+
+# Template mode: only the two open tags are tokens; everything else is TEMPLATE_TEXT.
+[lexer.modes.template]
+tokens = ["OPEN_TAG", "OPEN_ECHO"]
+text   = "TEMPLATE_TEXT"
+# `main` (code) mode is predefined: every literal, IDENT, NUMBER, comment, string class and the
+# tokens above without a `modes` list.
+
+# ──────────────────────────────────────────── grammar ────────────────────────────────────────────
+#
+# Idiom used throughout for lists with an optional trailing comma (overlap = "deny" requires it):
+#     item (&(',' !CLOSE) ',' item)* ','?
+# The predicate makes the repetition commit on `,` only when another item follows.
+#
+# TOML note: every plain `name = "…"` rule comes first; table-form rules ([rules.<name>]) come last,
+# because keys after a [header] belong to that header's table.
+
+[rules]
+file = "head:TEMPLATE_TEXT? (OPEN_TAG | &OPEN_ECHO)? items:_top*"
+
+_top     = "namespace_decl | use_stmt | _stmt"
+_ns_item = "use_stmt | _stmt"
+
+_stmt = """
+    block | if_stmt | while_stmt | do_while_stmt | for_stmt | foreach_stmt | switch_stmt | try_stmt
+  | return_stmt | break_stmt | continue_stmt | echo_stmt | echo_tag | template_chunk
+  | global_stmt | static_stmt | unset_stmt | const_stmt | declare_stmt
+  | fn_decl | class_decl | interface_decl | trait_decl | enum_decl
+  | empty_stmt | expr_stmt
+"""
+
+# A statement ends at `;`, just before `?>`, or at the end of input (PHP: `?>` implies `;`).
+_end = "';' | &CLOSE_TAG | &EOF"
+
+# ── template islands ──
+template_chunk = "close:CLOSE_TAG text:TEMPLATE_TEXT? (OPEN_TAG | &OPEN_ECHO | &EOF)"
+echo_tag       = "OPEN_ECHO values:expr (',' values:expr)* _end"
+
+# ── namespaces and imports ──
+namespace_decl = """
+    'namespace' ( name:qualified_name _end items:_ns_item*
+                | name:qualified_name? '{' items:_ns_item* '}' )
+"""
+use_stmt   = "'use' form:('function' | 'const')? clauses:use_clause (',' clauses:use_clause)* _end"
+use_clause = '''
+    path:qualified_name
+    ( 'as' alias:IDENT
+    | &('\' '{') '\' '{' group:use_clause (&(',' !'}') ',' group:use_clause)* ','? '}' )?
+'''
+qualified_name = '''
+    global:'\'? parts:IDENT (&('\' IDENT) '\' parts:IDENT)*
+'''
+
+# ── statements ──
+block         = "'{' stmts:_stmt* '}'"
+empty_stmt    = "';'"
+expr_stmt     = "expr:expr _end"
+echo_stmt     = "'echo' values:expr (',' values:expr)* _end"
+global_stmt   = "'global' names:VARIABLE (',' names:VARIABLE)* _end"
+static_stmt   = "'static' vars:static_var (',' vars:static_var)* _end"
+static_var    = "name:VARIABLE ('=' init:expr)?"
+unset_stmt    = "'unset' '(' places:expr (&(',' !')') ',' places:expr)* ','? ')' _end"
+const_stmt    = "'const' items:const_item (',' items:const_item)* _end"
+const_item    = "name:WORD '=' value:expr"
+declare_stmt  = "'declare' '(' directives:declare_item (',' directives:declare_item)* ')' (_end | body:block)"
+declare_item  = "name:IDENT '=' value:expr"
+return_stmt   = "'return' value:expr? _end"
+break_stmt    = "'break' level:NUMBER? _end"
+continue_stmt = "'continue' level:NUMBER? _end"
+
+# `else`/`elseif` branches of the braces form (if_stmt itself is a table rule below).
+else_clause   = "'else' body:_stmt"
+# The alternative syntax `if (…): … elseif (…): … else: … endif;`, which templates use.
+elseif_alt    = "'elseif' '(' cond:expr ')' ':' then:alt_block else:(elseif_alt | else_alt)?"
+else_alt      = "'else' ':' body:alt_block"
+alt_block     = "stmts:_stmt*"
+
+while_stmt    = "'while' '(' cond:expr ')' (':' body:alt_block 'endwhile' _end | body:_stmt)"
+do_while_stmt = "'do' body:_stmt 'while' '(' cond:expr ')' _end"
+for_stmt = """
+    'for' '(' init:for_exprs? ';' cond:for_exprs? ';' step:for_exprs? ')'
+    (':' body:alt_block 'endfor' _end | body:_stmt)
+"""
+for_exprs     = "exprs:expr (',' exprs:expr)*"
+foreach_stmt = """
+    'foreach' '(' source:expr 'as' (&(_foreach_target '=>') key:_foreach_target '=>')?
+    byref:'&'? value:_foreach_target ')'
+    (':' body:alt_block 'endforeach' _end | body:_stmt)
+"""
+_foreach_target = "VARIABLE | list_expr | array_lit"
+switch_stmt = """
+    'switch' '(' subject:expr ')'
+    ('{' cases:case_clause* '}' | ':' cases:case_clause* 'endswitch' _end)
+"""
+case_clause  = "('case' value:expr | default:'default') (':' | ';') stmts:_stmt*"
+try_stmt     = "'try' body:block catches:catch_clause* ('finally' finally:block)?"
+catch_clause = "'catch' '(' types:qualified_name ('|' types:qualified_name)* name:VARIABLE? ')' body:block"
+
+# ── declarations ──
+attribute = "'#[' items:attr_item (&(',' !']') ',' items:attr_item)* ','? ']'"
+attr_item = "name:qualified_name ('(' args:arg_list? ')')?"
+
+fn_decl = """
+    attrs:attribute* 'async'? 'function' ref:'&'? name:IDENT
+    '(' params:param_list? ')' (':' ret:_type)? body:block
+"""
+param_list = "params:param (&(',' !')') ',' params:param)* ','?"
+# `promote` is constructor property promotion: `public function __construct(private int $x)`.
+param = """
+    attrs:attribute* promote:_promo_mod* ty:_type? ref:'&'? rest:'...'? name:VARIABLE ('=' default:expr)?
+"""
+_promo_mod = "'public' | 'protected' | 'private' | 'readonly'"
+
+class_decl = """
+    attrs:attribute* mods:_class_mod* 'class' name:IDENT
+    ('extends' base:qualified_name)?
+    ('implements' ifaces:qualified_name (',' ifaces:qualified_name)*)?
+    '{' members:_member* '}'
+"""
+_class_mod = "'abstract' | 'final' | 'readonly'"
+interface_decl = """
+    attrs:attribute* 'interface' name:IDENT
+    ('extends' supers:qualified_name (',' supers:qualified_name)*)?
+    '{' members:_member* '}'
+"""
+trait_decl = "attrs:attribute* 'trait' name:IDENT '{' members:_member* '}'"
+enum_decl = """
+    attrs:attribute* 'enum' name:IDENT (':' backing:_type)?
+    ('implements' ifaces:qualified_name (',' ifaces:qualified_name)*)?
+    '{' members:_enum_member* '}'
+"""
+_enum_member = "enum_case | _member"
+enum_case    = "attrs:attribute* 'case' name:WORD ('=' value:expr)? ';'"
+
+_member     = "trait_use | class_const | method | property"
+_member_mod = "'public' | 'protected' | 'private' | 'static' | 'abstract' | 'final' | 'readonly'"
+method = """
+    attrs:attribute* mods:_member_mod* 'async'? 'function' ref:'&'? name:WORD
+    '(' params:param_list? ')' (':' ret:_type)? (body:block | ';')
+"""
+class_const = """
+    attrs:attribute* mods:_member_mod* 'const' (&(_type WORD '=') ty:_type)?
+    items:const_item (',' items:const_item)* ';'
+"""
+trait_use  = "'use' traits:qualified_name (',' traits:qualified_name)* (';' | '{' rules:trait_rule* '}')"
+trait_rule = """
+    (&(qualified_name '::') from:qualified_name '::')? method:WORD
+    ( 'insteadof' insteadof:qualified_name (',' insteadof:qualified_name)*
+    | 'as' vis:('public' | 'protected' | 'private')? alias:WORD? ) ';'
+"""
+
+# ── types (PHP 8.2 DNF types) ──
+_type           = "nullable_ty | union_ty | intersection_ty | _type_atom"
+nullable_ty     = "'?' inner:_type_atom"
+union_ty        = "members:_union_member ('|' members:_union_member)+"
+_union_member   = "paren_ty | intersection_ty | _type_atom"
+# `&` followed by a variable or `...` is a by-reference parameter, not an intersection.
+intersection_ty = "members:_type_atom (&('&' !(VARIABLE | '...')) '&' members:_type_atom)+"
+paren_ty        = "'(' inner:intersection_ty ')'"
+_type_atom      = "qualified_name | special_type"
+special_type    = "kw:('array' | 'callable' | 'static' | 'self' | 'parent' | 'null' | 'false' | 'true')"
+
+# ── expression operands ──
+_primary = """
+    closure | arrow_fn | new_expr | match_expr | isset_expr | empty_expr | exit_expr | print_expr
+  | include_expr | yield_expr | throw_expr | list_expr | array_lit | old_array_lit | magic_const
+  | DQ_STRING | SQ_STRING | HEREDOC | HEREDOC_Q | NOWDOC | NUMBER
+  | 'true' | 'false' | 'null'
+  | VARIABLE | var_var
+  | 'self' | 'parent' | 'static'
+  | qualified_name
+  | paren
+"""
+paren       = "'(' inner:expr ')'"
+var_var     = "'$' (inner:VARIABLE | inner:var_var | '{' inner:expr '}')"
+magic_const = "name:MAGIC_CONST"
+
+closure = """
+    'async'? static:'static'? 'function' ref:'&'? '(' params:param_list? ')'
+    ('use' '(' uses:closure_use (&(',' !')') ',' uses:closure_use)* ','? ')')?
+    (':' ret:_type)? body:block
+"""
+closure_use = "ref:'&'? name:VARIABLE"
+arrow_fn = """
+    'async'? static:'static'? 'fn' ref:'&'? '(' params:param_list? ')' (':' ret:_type)? '=>' body:expr
+"""
+
+new_expr   = "'new' class:_class_ref ('(' args:arg_list? ')')?"
+_class_ref = "qualified_name | VARIABLE | class_kw | anon_class | paren"
+class_kw   = "kw:('static' | 'self' | 'parent')"
+anon_class = """
+    'class' ('(' args:arg_list? ')')? ('extends' base:qualified_name)?
+    ('implements' ifaces:qualified_name (',' ifaces:qualified_name)*)?
+    '{' members:_member* '}'
+"""
+
+arg_list = "args:arg (&(',' !')') ',' args:arg)* ','?"
+arg      = "(&(WORD ':') name:WORD ':')? spread:'...'? value:expr"
+
+match_expr = "'match' '(' subject:expr ')' '{' (arms:match_arm (&(',' !'}') ',' arms:match_arm)* ','?)? '}'"
+match_arm  = "(default:'default' | conds:expr (&(',' !'=>') ',' conds:expr)* ','?) '=>' body:expr"
+
+isset_expr   = "'isset' '(' args:expr (&(',' !')') ',' args:expr)* ','? ')'"
+empty_expr   = "'empty' '(' arg:expr ')'"
+print_expr   = "'print' value:expr"
+include_expr = "kw:('include' | 'include_once' | 'require' | 'require_once') path:expr"
+throw_expr   = "'throw' value:expr"
+list_expr    = "'list' '(' items:list_item? (',' items:list_item?)* ')'"
+list_item    = "(&(expr '=>') key:expr '=>')? ref:'&'? value:expr"
+
+array_lit     = "'[' (items:array_item (&(',' !']') ',' items:array_item)* ','?)? ']'"
+old_array_lit = "'array' '(' (items:array_item (&(',' !')') ',' items:array_item)* ','?)? ')'"
+array_item    = "spread:'...' value:expr | (&(expr '=>') key:expr '=>')? ref:'&'? value:expr"
+
+# PHP's simple interpolation inside strings: "$a", "$a[0]", "$a[-1]", "$a[key]", "$a[$i]", "$o->p".
+# The DQ_VAR / HEREDOC_VAR token is parsed by this rule (a self-injection, LSF2 §9.5.4).
+simple_interp = "var:VARIABLE ('[' key:_simple_key ']' | '->' prop:WORD)?"
+_simple_key   = "NUMBER | neg_key | VARIABLE | bare_key"
+neg_key       = "sign:'-' digits:NUMBER"
+bare_key      = "name:IDENT"          # "$a[key]" means $a['key']
+
+# ── table-form rules (options), then the expression rule ──
+
+# Dangling `else`: the nearest `if` takes it, as in PHP. Inside the alternative syntax that greedy
+# choice can meet `else:` and fail exactly where PHP's parser fails, so the LL(2) divergence the
+# overlap check finds here is intended.
+[rules.if_stmt]
+rule = """
+    'if' '(' cond:expr ')'
+    ( ':' then:alt_block else:(elseif_alt | else_alt)? 'endif' _end
+    | then:_stmt else:(elseif_clause | else_clause)? )
+"""
+allow = ["overlap"]
+
+# lang-forge copy: same divergence as `if_stmt` (an `else:` of the alternative syntax after a
+# braces-form `elseif`), found by the overlap check; acknowledged the same way.
+[rules.elseif_clause]
+rule  = "'elseif' '(' cond:expr ')' then:_stmt else:(elseif_clause | else_clause)?"
+allow = ["overlap"]
+
+# `exit(…)` is exit's own argument list, never a call of exit's result.
+[rules.exit_expr]
+rule  = "kw:('exit' | 'die') ('(' value:expr? ')')?"
+allow = ["overlap"]
+
+# `yield [1]` yields an array (PHP); it is not `yield` indexed by `[1]`.
+[rules.yield_expr]
+rule  = "'yield' ('from' from:expr | (&(expr '=>') key:expr '=>')? value:expr)?"
+allow = ["overlap"]
+
+# `public static int $x`: `static` is a modifier here, never the start of the type.
+[rules.property]
+rule  = "attrs:attribute* mods:_member_mod+ ty:_type? name:VARIABLE ('=' default:expr)? ';'"
+allow = ["overlap"]
+doc   = "One property per declaration. [OQ-9] PHP also allows `public $a, $b;`."
+
+# Precedence follows PHP 8 (php.net "Operator Precedence"), lowest first.
+[rules.expr]
+operand = "_primary"
+levels  = [
+    { left    = ["or"],  node = "word_logic" },
+    { left    = ["xor"], node = "word_logic" },
+    { left    = ["and"], node = "word_logic" },
+    { right   = ["=", "+=", "-=", "*=", "/=", ".=", "%=", "**=", "&=", "|=", "^=", "<<=", ">>=", "??="], node = "assign" },
+    { none    = ["?"], then = "then:expr? ':'", node = "ternary" },     # PHP 8: nested ternaries need parentheses
+    { right   = ["??"], node = "coalesce" },
+    { left    = ["||"], node = "logic" },
+    { left    = ["&&"], node = "logic" },
+    { left    = ["|"] },
+    { left    = ["^"] },
+    { left    = ["&"] },
+    { none    = ["==", "!=", "===", "!==", "<=>"], node = "equality" },
+    { none    = ["<", "<=", ">", ">="], node = "compare" },
+    { left    = ["."], node = "concat" },
+    { left    = ["<<", ">>"] },
+    { left    = ["+", "-"] },
+    { left    = ["*", "/", "%"] },
+    { prefix  = ["!"] },
+    { left    = ["instanceof"], node = "instanceof" },
+    { prefix  = ["-", "+", "~", "++", "--", "INT_CAST", "FLOAT_CAST", "STRING_CAST", "BOOL_CAST", "ARRAY_CAST", "OBJECT_CAST", "await", "spawn", "clone"] },
+    { prefix  = ["&"], node = "ref_expr" },                              # only meaningful in `$a = &$b`
+    { right   = ["**"] },
+    { postfix = ["++", "--"] },
+    { postfix = ["("], then = "args:arg_list? ')'", node = "call" },
+    { postfix = ["["], then = "index:expr? ']'", node = "index" },       # `$a[]` (append) has no index
+    { postfix = ["->", "?->"], then = "(dyn:VARIABLE | '{' dyn:expr '}' | member:WORD) (call:'(' args:arg_list? ')')?", node = "member" },
+    { postfix = ["::"], then = "member:(WORD | VARIABLE)", node = "static_member" },   # WORD covers `Foo::class`
+]
+
+# ──────────────────────────────────────── injections ─────────────────────────────────────────────
+
+[injections.inline_html]
+target   = "TEMPLATE_TEXT"
+language = "html"
+resolve  = "editor"          # LS does not parse HTML; editors get injections.scm / TextMate embedding
+combined = true              # all template text of a file is one HTML document
+scope    = "text.html.basic"
+
+# ─────────────────────────────────────────── hooks ───────────────────────────────────────────────
+
+# One lowering capability handles every construct that HIR + lower-lang cannot express declaratively
+# yet (see GAPS). It is the honest cost of Mox's PHP heritage, listed construct by construct.
+[hooks.mox_lower]
+kind       = "lower"
+capability = "mox.lower"
+
+# ──────────────────────────────────────────── ast ────────────────────────────────────────────────
+
+[ast]
+Statement   = ["block", "if_stmt", "while_stmt", "do_while_stmt", "for_stmt", "foreach_stmt", "switch_stmt", "try_stmt", "return_stmt", "break_stmt", "continue_stmt", "echo_stmt", "echo_tag", "template_chunk", "global_stmt", "static_stmt", "unset_stmt", "const_stmt", "declare_stmt", "empty_stmt", "expr_stmt", "Declaration"]
+Declaration = ["fn_decl", "class_decl", "interface_decl", "trait_decl", "enum_decl", "namespace_decl", "use_stmt"]
+Member      = ["method", "property", "class_const", "trait_use", "enum_case"]
+Expression  = ["expr", "binary", "prefix", "postfix", "word_logic", "logic", "assign", "ternary", "coalesce", "equality", "compare", "concat", "instanceof", "ref_expr", "call", "index", "member", "static_member", "closure", "arrow_fn", "new_expr", "match_expr", "isset_expr", "empty_expr", "exit_expr", "print_expr", "include_expr", "yield_expr", "throw_expr", "array_lit", "old_array_lit", "list_expr", "var_var", "paren", "magic_const", "qualified_name", "DQ_STRING", "HEREDOC", "HEREDOC_Q"]
+Type        = ["nullable_ty", "union_ty", "intersection_ty", "paren_ty", "special_type", "qualified_name"]
+
+# ───────────────────────────────────────── semantics ─────────────────────────────────────────────
+
+[semantics.policy]
+overflow          = "promote"    # PHP: PHP_INT_MAX + 1 is a float (OPS §2)
+div_zero          = "error"      # DivisionByZeroError
+shift             = "error"      # PHP's shift rule is neither `error` nor `mask`: << and >> use intrinsics (GAPS B7)
+float_to_int      = "error"
+throws            = "always"     # any PHP function may throw
+yields            = "inferred"   # a `yield` makes a generator
+asyncs            = "declared"   # `async function`
+implicit_locals   = true         # assignment declares a local
+ident_patterns    = "bind"
+place_args        = "places"     # by-reference parameters are decided by the callee at run time
+implicit_receiver = "this"       # pending: `$this` in methods
+loop_vars         = "function"   # pending: foreach/catch variables outlive the loop (PHP)
+break_levels      = "numeric"    # pending: `break 2`
+
+[semantics.literals]
+int_overflow       = "float"     # 9223372036854775808 is a float in PHP
+int_radix_overflow = "float"     # 0xFFFFFFFFFFFFFFFF too
+
+[semantics.scope]
+preset = "php"   # hoisted functions/classes, `self::`/`parent::` early, `static::` late, no globs, implicit globals
+# names_case: all case-sensitive. [OQ-1] PHP function/class names are case-insensitive; Mox is not
+# (the porter canonicalizes), which also removes Mox's dependency on resolve-lang 0.3 (ISSUES P14).
+
+[semantics.tokens]
+VARIABLE      = { role = "var", sigil = 1 }
+IDENT         = "name"
+NUMBER        = "number"
+SQ_STRING     = { role = "str", escapes = "quotes" }
+NOWDOC        = { role = "str", escapes = "class" }                      # pending: multi-part delimiters
+TEMPLATE_TEXT = { role = "str", escapes = "none", delimited = false }    # pending: undelimited text
+"true"        = "true"
+"false"       = "false"
+"null"        = "null"
+# DQ_VAR, HEREDOC_VAR, HEREDOC_Q_VAR need no role: each lowers through its `simple_interp` subtree.
+
+[semantics.modifiers]
+"public"    = "public"
+"protected" = "protected"
+"private"   = "private"
+"static"    = "static"
+"abstract"  = "abstract"
+"final"     = "final"
+"async"     = "async"
+"&"         = "ref"
+"..."       = { param = "rest", arg = "spread" }   # pending: per-archetype modifiers
+"readonly"  = "readonly"                           # pending: no Modifier::Readonly yet
+
+[semantics.roots]
+"self"   = "self_type"
+"parent" = "parent_type"
+"static" = "static_type"
+
+[semantics.structure]
+containers = ["kind:param_list", "kind:arg_list", "kind:qualified_name"]
+skip       = [",", ";", "::", "=>", '\']
+errors     = ["ERROR"]
+
+[semantics.type_names]
+int    = "i64"
+float  = "f64"
+string = "str"
+bool   = "bool"
+mixed  = "any"
+never  = "never"
+# `void`, `iterable`, `object` and the keyword types are host-declared types (GAPS B, lower-lang).
+
+[semantics.templates]
+bool_and       = "if ${lhs} { not(not(${rhs})) } else { false }"              # PHP && returns a bool
+bool_or        = "if ${lhs} { true } else { not(not(${rhs})) }"
+pre_increment  = "{ ${place} = add(${place}, 1); ${place} }"                 # GAPS B2: place evaluated more than once
+pre_decrement  = "{ ${place} = sub(${place}, 1); ${place} }"
+post_decrement = "{ let old = ${place}; ${place} = sub(old, 1); old }"
+new_object     = "extern:mox.new(${class}, ${...args})"
+echo           = "extern:mox.echo(${...values})"
+echo_text      = "extern:mox.echo(${...text})"
+isset          = "extern:mox.isset(${...args})"
+empty          = "extern:mox.empty(${arg})"
+unset          = "extern:mox.unset(${...places})"
+exit           = "extern:mox.exit(${...value})"
+print          = "extern:mox.print(${value})"
+include        = "extern:mox.include(${path})"
+include_once   = "extern:mox.include_once(${path})"
+require        = "extern:mox.require(${path})"
+require_once   = "extern:mox.require_once(${path})"
+spawn_task     = "spawn(closure[by-value]() => ${operand})"                  # values captured at spawn time
+# `yield from g`: delegate to an inner generator; the expression's value is the inner one's return value.
+yield_from     = """
+{ let g = extern:mox.iter(${from});
+  loop {
+    match extern:mox.next(g) {
+      null => break extern:mox.gen_return(g),
+      (k, v) => { yield (k, v); }
+    }
+  } }
+"""
+
+# Node kinds lowered unconditionally through a template or the `mox_lower` hook.
+[semantics.lower]
+while_stmt     = { template = "while" }                           # holes cond, body: the node's labels
+do_while_stmt  = { template = "do_while" }
+for_stmt       = { template = "c_for" }                           # init (statements), cond, step, body
+echo_stmt      = { template = "echo" }
+echo_tag       = { template = "echo" }
+template_chunk = { template = "echo_text" }
+unset_stmt     = { template = "unset" }
+isset_expr     = { template = "isset" }
+empty_expr     = { template = "empty" }
+exit_expr      = { template = "exit" }
+print_expr     = { template = "print" }
+switch_stmt    = { hook = "mox_lower" }                           # fallthrough + loose ==
+match_expr     = { hook = "mox_lower" }                           # arms are expressions compared with ===
+enum_decl      = { hook = "mox_lower" }                           # a sum with members and backing values
+list_expr      = { hook = "mox_lower" }                           # only valid as an assignment target
+magic_const    = { hook = "mox_lower" }
+bare_key       = { hook = "mox_lower" }                           # an identifier meaning a string key
+class_kw       = { hook = "mox_lower" }
+anon_class     = { hook = "mox_lower" }
+trait_rule     = { hook = "mox_lower" }                           # insteadof/as (lower-lang 0.3, ISSUES P15)
+# Sub-nodes owned by the hook-lowered constructs above (listed so the unmapped-node check stays clean).
+case_clause    = { hook = "mox_lower" }
+match_arm      = { hook = "mox_lower" }
+enum_case      = { hook = "mox_lower" }
+list_item      = { hook = "mox_lower" }
+declare_item   = { hook = "mox_lower" }                           # never reached: declare_stmt lowers to nothing
+
+[semantics.bind]
+file           = { arch = "module", items = "items" }
+namespace_decl = { arch = "module", name = "name", items = "items" }
+use_stmt       = { arch = "splice", items = "clauses" }
+use_clause     = [
+    { when = "group", hook = "mox_lower" },                       # pending: nested use trees (ISSUES P15)
+    { arch = "import", path = "path", alias = "alias" },
+]
+qualified_name = { arch = "path", segments = "parts", global = "global" }
+
+# statements
+block          = { arch = "block", stmts = "stmts" }
+alt_block      = { arch = "block", stmts = "stmts" }
+empty_stmt     = { arch = "splice" }
+expr_stmt      = { arch = "expr_stmt", expr = "expr" }
+global_stmt    = { arch = "global_decl", names = "names" }
+static_stmt    = { arch = "splice", items = "vars" }
+static_var     = { arch = "static", name = "name", init = "init" }
+const_stmt     = { arch = "splice", items = "items" }
+const_item     = { arch = "const", name = "name", value = "value" }
+declare_stmt   = { arch = "splice" }                              # [OQ-5] Mox is always strict; declare() is accepted and ignored
+return_stmt    = { arch = "return", value = "value" }
+break_stmt     = { arch = "break", label = "level" }              # numeric levels: pending policy break_levels
+continue_stmt  = { arch = "continue", label = "level" }
+if_stmt        = { arch = "if", cond = "cond", then = "then", else = "else" }
+elseif_clause  = { arch = "if", cond = "cond", then = "then", else = "else" }
+elseif_alt     = { arch = "if", cond = "cond", then = "then", else = "else" }
+else_clause    = { arch = "pass", inner = "body" }
+else_alt       = { arch = "pass", inner = "body" }
+for_exprs      = { arch = "block", stmts = "exprs", tail_from_last = true }
+foreach_stmt   = [
+    { when = "byref", hook = "mox_lower" },                       # `foreach ($a as &$v)` writes through
+    { template = "for_each", iter = "mox.iter", next = "mox.next" },   # holes source, key, value, body
+]
+try_stmt       = { arch = "try", body = "body", catches = "catches", finally = "finally" }
+catch_clause   = { arch = "catch", types = "types", name = "name", body = "body" }
+
+# declarations
+attribute      = { arch = "splice", items = "items" }
+attr_item      = { arch = "attribute", name = "name", args = "args", target = "parent" }   # pending archetype (ISSUES P15)
+fn_decl        = { arch = "fn", name = "name", params = "params", ret = "ret", body = "body" }
+param          = [
+    { when = "promote", hook = "mox_lower" },                     # constructor promotion: `private int $x`
+    { arch = "param", pat = "name", ty = "ty", default = "default" },
+]
+class_decl     = { arch = "class", name = "name", bases = "base", interfaces = "ifaces", members = "members" }
+interface_decl = { arch = "interface", name = "name", supers = "supers", items = "members" }
+trait_decl     = { arch = "class", name = "name", members = "members", mixin = true }
+method         = { arch = "fn", name = "name", params = "params", ret = "ret", body = "body" }
+property       = { arch = "field_decl", name = "name", ty = "ty", default = "default" }
+class_const    = { arch = "splice", items = "items", modifiers = "inherit" }   # pending option
+trait_use      = { arch = "mixin_use", mixins = "traits" }
+
+# types
+nullable_ty     = { arch = "nullable_ty", inner = "inner" }
+paren_ty        = { arch = "pass", inner = "inner" }
+union_ty        = { arch = "union_ty", members = "members" }        # pending: HIR has no union type
+intersection_ty = { arch = "intersection_ty", members = "members" } # pending
+special_type    = { arch = "path", segments = "kw" }               # GAPS B: keyword type names
+
+# expressions
+expr           = { arch = "pass", inner = "#0" }                    # the expression rule's own wrapper node
+binary         = { arch = "binary", lhs = "lhs", op = "op", rhs = "rhs" }
+word_logic     = { arch = "binary", lhs = "lhs", op = "op", rhs = "rhs" }
+logic          = { arch = "binary", lhs = "lhs", op = "op", rhs = "rhs" }
+coalesce       = { arch = "binary", lhs = "lhs", op = "op", rhs = "rhs" }
+equality       = { arch = "binary", lhs = "lhs", op = "op", rhs = "rhs" }
+compare        = { arch = "binary", lhs = "lhs", op = "op", rhs = "rhs" }
+concat         = { arch = "binary", lhs = "lhs", op = "op", rhs = "rhs" }
+instanceof     = { arch = "binary", lhs = "lhs", op = "op", rhs = "rhs" }
+prefix         = { arch = "unary", op = "op", operand = "operand" }
+postfix        = { arch = "postfix", operand = "operand", op = "op" }
+ref_expr       = { arch = "pass", inner = "operand" }
+assign         = [
+    { when = "kind:ref_expr", arch = "ref_assign", target = "lhs", source = "rhs" },   # $a = &$b
+    { when = "first:kind:array_lit", hook = "mox_lower" },                           # [$a, $b] = …
+    { when = "first:kind:list_expr", hook = "mox_lower" },                           # list($a, $b) = …
+    { arch = "assign", target = "lhs", op = "op", value = "rhs" },
+]
+ternary        = [
+    { when = "then", arch = "if", cond = "lhs", then = "then", else = "rhs" },
+    { template = "or_value" },                                                       # a ?: b  (holes lhs, rhs)
+]
+call           = { arch = "call", callee = "operand", args = "args" }
+arg            = { arch = "arg", name = "name", value = "value" }
+index          = [
+    { when = "index", arch = "index", base = "operand", index = "index" },
+    { arch = "append", base = "operand" },                                           # $a[] = v
+]
+member         = [
+    { when = "'?->'", hook = "mox_lower" },                                          # nullsafe
+    { when = "dyn", arch = "dyn_member", base = "operand", name = "dyn", args = "args", call = "call" },
+    { arch = "member", base = "operand", member = "member", args = "args", call = "call" },
+]
+static_member  = [
+    { when = "first:VARIABLE", hook = "mox_lower" },                                 # $cls::f()
+    { when = "'class'", hook = "mox_lower" },                                        # Foo::class
+    { arch = "path", segments = "*" },                                               # Foo::bar, self::X, static::f
+]
+paren          = { arch = "pass", inner = "inner" }
+var_var        = { arch = "var_var", inner = "inner" }
+closure        = { arch = "closure", params = "params", ret = "ret", captures = "uses", body = "body", implicit = "none" }
+closure_use    = { arch = "capture", name = "name" }
+arrow_fn       = { arch = "closure", params = "params", ret = "ret", body = "body", implicit = "by-value" }
+new_expr       = [
+    { when = "kind:anon_class", hook = "mox_lower" },
+    { when = "kind:class_kw", hook = "mox_lower" },                                  # new static / new self
+    { template = "new_object" },                                                     # holes class, args
+]
+include_expr   = [
+    { when = "'include_once'", template = "include_once" },
+    { when = "'require'", template = "require" },
+    { when = "'require_once'", template = "require_once" },
+    { template = "include" },
+]
+yield_expr     = [
+    { when = "from", template = "yield_from" },
+    { when = "key", hook = "mox_lower" },                                            # keyed yield (GAPS B4)
+    { arch = "yield", value = "value" },
+]
+throw_expr     = { arch = "throw", value = "value" }
+array_lit      = { arch = "map", entries = "items" }
+old_array_lit  = { arch = "map", entries = "items" }
+array_item     = [
+    { when = "spread", hook = "mox_lower" },                      # [...$a]
+    { when = "ref", hook = "mox_lower" },                         # [&$x]
+    { arch = "map_entry", key = "key", value = "value" },
+]
+DQ_STRING        = { arch = "interpolate", parts = "parts", join = { intrinsic = "mox.concat_n" } }   # pending
+HEREDOC          = { arch = "interpolate", parts = "parts", join = { intrinsic = "mox.concat_n" } }
+HEREDOC_Q        = { arch = "interpolate", parts = "parts", join = { intrinsic = "mox.concat_n" } }
+DQ_STRING_INTERP = { arch = "pass", inner = "value" }
+HEREDOC_INTERP   = { arch = "pass", inner = "value" }
+HEREDOC_Q_INTERP = { arch = "pass", inner = "value" }
+simple_interp  = [
+    { when = "key", arch = "index", base = "var", index = "key" },
+    { when = "prop", arch = "member", base = "var", member = "prop" },
+    { arch = "pass", inner = "var" },
+]
+neg_key        = { arch = "unary", op = "sign", operand = "digits" }
+
+[semantics.ops]
+"="   = "assign"
+"+="  = { compound = "add" }
+"-="  = { compound = "sub" }
+"*="  = { compound = "mul" }
+"/="  = { compound = "div", overflow = "promote", div_zero = "error" }
+"&="  = { compound = "and" }
+"|="  = { compound = "or" }
+"^="  = { compound = "xor" }
+"%="  = { compound = { intrinsic = "mox.mod" } }          # pending: non-OPS compound operators (GAPS B2)
+".="  = { compound = { intrinsic = "mox.concat" } }
+"**=" = { compound = { intrinsic = "mox.pow" } }
+"<<=" = { compound = { intrinsic = "mox.shl" } }
+">>=" = { compound = { intrinsic = "mox.shr" } }
+"??=" = { compound = { template = "coalesce" } }
+"??"  = { template = "coalesce" }
+"||"  = { template = "bool_or" }
+"&&"  = { template = "bool_and" }
+"or"  = { template = "bool_or" }
+"and" = { template = "bool_and" }
+"xor" = { intrinsic = "mox.xor" }
+"|"   = "or"
+"^"   = "xor"
+"&"   = { binary = "and", prefix = "identity" }            # prefix `&` only appears inside ref_expr
+# PHP 8 comparison semantics (numeric strings, loose ==, array comparison) live in the runtime.
+"=="  = { intrinsic = "mox.loose_eq" }
+"!="  = { intrinsic = "mox.loose_ne" }
+"===" = { intrinsic = "mox.identical" }
+"!==" = { intrinsic = "mox.not_identical" }
+"<=>" = { intrinsic = "mox.spaceship" }
+"<"   = { intrinsic = "mox.lt" }
+"<="  = { intrinsic = "mox.le" }
+">"   = { intrinsic = "mox.gt" }
+">="  = { intrinsic = "mox.ge" }
+"."   = { intrinsic = "mox.concat" }
+"<<"  = { intrinsic = "mox.shl" }
+">>"  = { intrinsic = "mox.shr" }
+"+"   = { binary = "add", prefix = { intrinsic = "mox.to_number" } }
+"-"   = { binary = "sub", prefix = "neg" }
+"*"   = "mul"
+"/"   = { op = "div", overflow = "promote", div_zero = "error" }   # PHP `/`: exact int, else the f64 quotient
+"%"   = { intrinsic = "mox.mod" }                         # PHP `%` truncates float operands to int first
+"**"  = { intrinsic = "mox.pow" }
+"!"   = "not"
+"~"   = { intrinsic = "mox.bit_not" }                     # GAPS B6
+"++"  = { prefix = { template = "pre_increment" }, postfix = { template = "post_increment" } }
+"--"  = { prefix = { template = "pre_decrement" }, postfix = { template = "post_decrement" } }
+"instanceof" = { intrinsic = "mox.instanceof" }
+INT_CAST     = { intrinsic = "mox.cast_int" }
+FLOAT_CAST   = { intrinsic = "mox.cast_float" }
+STRING_CAST  = { intrinsic = "mox.cast_string" }
+BOOL_CAST    = { intrinsic = "mox.cast_bool" }
+ARRAY_CAST   = { intrinsic = "mox.cast_array" }
+OBJECT_CAST  = { intrinsic = "mox.cast_object" }
+"await"      = "await"
+"spawn"      = { template = "spawn_task" }
+"clone"      = { intrinsic = "mox.clone" }
+
+# ─────────────────────────────────────────── types ───────────────────────────────────────────────
+
+[types]
+profile        = "dynamic"
+certain_errors = true        # arity errors on calls to this unit's own functions are reported statically
+string_add     = false       # `+` never concatenates (that is `.`)
+annotations    = "runtime"   # PHP: parameter, return and property types are enforced at run time (pending in bcgen-lang)
+
+# ────────────────────────────────────────── runtime ──────────────────────────────────────────────
+
+[runtime]
+values      = "dynamic"
+memory      = "rc"           # [OQ-3] PHP's deterministic destructors; generators close at the last reference
+cycles      = "collect"
+concurrency = "tasks"
+errors      = "exceptions"
+strings     = "bytes"        # PHP strings are byte strings (LSB §2.1)
+numbers     = { int = "i64", float = "f64", bigint = false }
+collections = { arrays = "ordered-map", copy = "cow", map_keys = "php" }   # PHP arrays
+
+# Slow paths of the VM's dynamic instructions (LSB §5.8): numeric strings, array `+`, PHP truthiness
+# ("0" and [] are falsy), ArrayAccess, __get/__set/__isset, Traversable, Countable, __invoke.
+[runtime.hooks]
+add       = "mox.rt.add"
+sub       = "mox.rt.sub"
+mul       = "mox.rt.mul"
+div       = "mox.rt.div"
+neg       = "mox.rt.neg"
+truthy    = "mox.rt.truthy"
+get_index = "mox.rt.get_index"
+set_index = "mox.rt.set_index"
+get_prop  = "mox.rt.get_prop"
+set_prop  = "mox.rt.set_prop"
+has_prop  = "mox.rt.has_prop"
+iter      = "mox.rt.iter"
+len       = "mox.rt.len"
+call      = "mox.rt.call"
+spawn     = "mox.rt.spawn"
+
+# Shared-nothing requests: each request handler runs in its own arena; ending the request frees it in O(1).
+[runtime.arenas.request]
+opened_by  = ["mox.http.serve"]
+escape     = "error"         # [OQ-4] a value stored past its request is an error (or "copy")
+limit      = "128MiB"
+finalizers = "run"           # __destruct of objects still alive at request end runs before the bulk free
+
+[runtime.sandbox]
+fuel          = true
+permissions   = ["time.read", "random"]   # files, network and env need an explicit grant
+deterministic = false
+
+# ────────────────────────────────────────── stdlib ───────────────────────────────────────────────
+
+[stdlib]
+mox  = { host = "mox", capability = "mox-host" }                        # runtime support: mox.rt.*, mox.http.*, …
+core = { host = "mox.core", capability = "mox-host", prelude = true }  # [OQ-10] PHP's global functions (strlen, count, array_map, …)
+# std = { source = "std/", prelude = true }   # Mox's own standard library in Mox, once it exists
+
+# ─────────────────────────────────────────── exec ────────────────────────────────────────────────
+
+[exec]
+modes   = ["interp", "jit", "aot", "hybrid"]
+default = "interp"
+entry   = "module"           # a file runs top to bottom, like PHP
+tier_up = { calls = 1000, loops = 10000 }
+
+# A typical app: classes compiled to native code, entry points and templates kept as loose scripts.
+[exec.publish]
+native      = ["src/**"]
+loose       = ["public/**", "templates/**"]
+load_order  = ["bootstrap/*.mox", "public/index.mox"]
+select      = "glob"
+annotations = { native = "native", script = "script" }   # #[native] / #[script] per function when select = "annotation"
+integrity   = "pinned"
+targets     = ["x86_64-linux", "aarch64-linux", "x86_64-windows", "aarch64-macos"]
+
+# ────────────────────────────────────────── tooling ──────────────────────────────────────────────
+
+[tooling.lsp]
+diagnostics = true
+folding = true
+selection_ranges = true
+outline = true
+semantic_tokens = true
+formatting = true
+completion = true
+hover = true
+goto = true
+references = true
+rename = true
+document_highlight = true
+workspace_symbols = true
+signature_help = true
+inlay_hints = false          # dynamic profile: no inferred types to show
+code_actions = true
+
+# PSR-12-like layout.
+[tooling.format]
+preset          = "conventional"
+indent          = 4
+width           = 120
+max_blank_lines = 1
+final_newline   = true
+verbatim        = ["ERROR", "TEMPLATE_TEXT", "kind:template_chunk"]
+
+[tooling.format.tokens]
+"->"  = { before = "none", after = "none" }
+"?->" = { before = "none", after = "none" }
+"::"  = { before = "none", after = "none" }
+"=>"  = { around = "single" }
+"."   = { around = "single" }
+"??"  = { around = "single" }
+"!"   = { after = "none" }
+"..." = { after = "none" }
+"'$'" = { after = "none" }
+
+[tooling.format.nodes]
+block        = { delimiters = { open = "{", close = "}", inner = "hard" }, indent = "block", empty = "none", blank_lines = 1 }
+class_decl   = { before = "hard" }
+fn_decl      = { before = "hard" }
+method       = { before = "hard" }
+array_lit    = { group = true, indent = "block", delimiters = { open = "[", close = "]", inner = "softline" }, separator = { token = ",", after = "line", trailing = "preserve" } }
+arg_list     = { group = true, separator = { token = ",", after = "line", trailing = "preserve" } }
+param_list   = { group = true, separator = { token = ",", after = "line", trailing = "preserve" } }
+match_expr   = { group = true }
+
+[tooling.highlight]
+"@keywords"         = "@keyword"
+"@operators"        = "@operator"
+"@brackets"         = "@punctuation.bracket"
+"@delimiters"       = "@punctuation.delimiter"
+"@strings"          = "@string"
+"@numbers"          = "@number"
+"@comments"         = "@comment"
+DOC_COMMENT         = "@comment.documentation"
+VARIABLE            = "@variable"
+DQ_VAR              = "@variable"
+MAGIC_CONST         = "@constant.builtin"
+OPEN_TAG            = "@punctuation.special"
+OPEN_ECHO           = "@punctuation.special"
+CLOSE_TAG           = "@punctuation.special"
+TEMPLATE_TEXT       = "@embedded"
+INT_CAST            = "@keyword.operator"
+"'true'"            = "@boolean"
+"'false'"           = "@boolean"
+"'null'"            = "@constant.builtin"
+"'function'"        = "@keyword.function"
+"'fn'"              = "@keyword.function"
+"'return'"          = "@keyword.return"
+"fn_decl.name"      = "@function"
+"method.name"       = "@function.method"
+"class_decl.name"   = "@type"
+"interface_decl.name" = "@type"
+"trait_decl.name"   = "@type"
+"enum_decl.name"    = "@type"
+"param.name"        = "@variable.parameter"
+"member.member"     = "@property"
+"attr_item.name"    = "@attribute"
+"namespace_decl.name" = "@module"
+
+[tooling.outline]
+namespace_decl = { name = "name", kind = "namespace" }
+fn_decl        = { name = "name", kind = "function" }
+class_decl     = { name = "name", kind = "class" }
+interface_decl = { name = "name", kind = "interface" }
+trait_decl     = { name = "name", kind = "interface" }
+enum_decl      = { name = "name", kind = "enum" }
+enum_case      = { name = "name", kind = "enum_member" }
+method         = { name = "name", kind = "method" }
+property       = { name = "name", kind = "property" }
+const_item     = { name = "name", kind = "constant" }
+
+[tooling.folding]
+nodes    = ["block", "class_decl", "interface_decl", "trait_decl", "enum_decl", "array_lit", "match_expr", "switch_stmt", "alt_block"]
+comments = true
+regions  = { start = "#region", end = "#endregion" }
+
+[tooling.repl]
+prompt       = "mox> "
+continuation = "...> "
+mode         = "main"        # REPL input is code; no `<?mox` needed
+
+[tooling.editor]
+auto_close = [
+    { open = "{", close = "}" },
+    { open = "[", close = "]" },
+    { open = "(", close = ")" },
+    { open = "'", close = "'", not_in = ["string", "comment"] },
+    { open = '"', close = '"', not_in = ["string", "comment"] },
+    { open = "<?mox", close = " ?>" },
+]
+
+[tooling.treesitter]
+word       = "IDENT"
+scope      = "source.mox"
+file_types = ["mox"]
+first_line = '<\?mox'
+
+[tooling.textmate]
+scope    = "source.mox"
+embedded = { "text.html.basic" = "TEMPLATE_TEXT" }
+
+[tooling.docs]
+title = "The Mox Language"
+
+[tooling.debug]
+enabled = true
+
+[tooling.mcp]
+enabled = true
+run     = "sandboxed"
+
+# ──────────────────────────────────────── capabilities ───────────────────────────────────────────
+
+[capabilities]
+include = ["lint:core"]
+
+[capabilities."lint:core"]
+kind   = "lint"
+source = "builtin"
+
+[capabilities."mox.lower"]
+kind    = "lower"
+source  = "script:capabilities/mox_lower.lss"   # LS-script (D10), so Packaged mode works; does not exist yet
+version = "0.1.0"
+
+[capabilities.mox-host]
+kind    = "host"
+source  = "crate:mox-host@0.1"                  # the Mox runtime library (host-lang modules mox.*); does not exist yet
+version = "0.1.0"
+
+[lints]
+unused-variable    = "warn"
+undefined-variable = "warn"     # PHP warns on read of an undefined variable
+unreachable-code   = "warn"
+shadowing          = "allow"
+
+[macros]
+style = "none"
+
+# ─────────────────────────────────────────── emit ────────────────────────────────────────────────
+
+[emit]
+repos    = ["compiler", "lsp", "tree-sitter", "vscode", "std", "docs", "mcp", "github-meta"]
+github   = { org = "mox-lang", visibility = "public" }   # [OQ-11] organization name
+license  = "MIT OR Apache-2.0"                           # [OQ-11]
+authors  = ["James Gober"]
+specialize = []                                          # [OQ-12] direct-coded front end for per-request parsing?
+branches = "per-line"
+
+# [migrate]: none. This is Mox 0.1.0; there is no earlier Mox version to migrate from. PHP → Mox
+# porting is not a [migrate] job: it is a PHP sketch lowering into the same HIR plus Mox's skin
+# printer (LANGUAGES.md, SCENARIOS I1/I11).
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+#  OWNER QUESTIONS
+#
+#  OQ-1  Case. PHP keywords and function/class/method names are case-insensitive; variables and
+#        constants are not. This sketch makes Mox fully case-sensitive (lowercase keywords) and leaves
+#        canonicalization to the PHP porter. Alternative: `[lexer.keywords] case = "ascii-insensitive"`
+#        and `[semantics.scope] names_case = { fn = "insensitive", class = "insensitive" }` (needs
+#        resolve-lang 0.3, ISSUES P14).
+#  OQ-2  Extensions. Only `.mox` (template-first, like PHP). Add a code-first extension (for example
+#        `.moxs`) via `[language.files] moxs = { mode = "main" }` for libraries and CLI scripts?
+#  OQ-3  Memory. `rc` + cycle collection (PHP-compatible destructor timing, immediate generator close)
+#        vs tracing `gc` (simpler, faster allocation, non-deterministic destructors).
+#  OQ-4  Request arenas. What happens when a value outlives its request (stored in a static cache,
+#        a global, a long-lived task): `error` (this sketch) or a deep `copy`? And which host entry
+#        points open a request scope besides `mox.http.serve` (CLI workers, queue consumers)?
+#  OQ-5  Strictness. Mox treats every file as `declare(strict_types=1)` (no coercive scalar typing);
+#        `declare(...)` is accepted and ignored. Keep PHP's coercive mode as an option?
+#  OQ-6  Literals. Leading-zero octal (`0755`) is an error ("write 0o755") rather than PHP's octal.
+#  OQ-7  Dropped PHP features: `goto`, `eval`, `__halt_compiler`, `var` properties (reserved, not
+#        supported), backtick shell execution and the `@` error-suppression operator (not in the
+#        grammar), `(unset)`/`(integer)`/`(double)`/`(boolean)`/`(real)` cast spellings, `<>`.
+#        Confirm the list; the porter flags each.
+#  OQ-8  Interpolation. Supported: "$a", "$a[0]", "$a[key]", "$o->p", "{$expr}". Not supported:
+#        PHP's "${name}" / "${expr}" (deprecated in PHP 8.2).
+#  OQ-9  `public $a, $b;` (several properties in one declaration) is not in the grammar.
+#  OQ-10 Library surface. PHP's global functions are exposed unqualified from the `mox.core` host
+#        module (prelude). How much of PHP's function library is in scope for 1.0, and is it host
+#        code (Rust) or Mox code in `std/`?
+#  OQ-11 GitHub organization name, license, authors for the emitted repos.
+#  OQ-12 Should Source mode emit a direct-coded lexer/parser (`[emit] specialize`)? Mox images
+#        precompile, so per-request parsing should not exist in production; the REPL and dev server
+#        would benefit.
+#  OQ-13 Concurrency syntax. `async function`, `await expr`, `spawn expr` (value capture at spawn time),
+#        all contextual keywords. PHP has Fibers as a class API instead; Mox could also expose that.
+#  OQ-14 `++`/`--` on strings (PHP's "a"++ == "b") is not kept: `++` is `+ 1`. PHP 8.3 deprecated
+#        most of it.
+#
+#  GAPS
+#
+#  A. What LSF2 cannot express: none remain. Each construct below either has a declarative form
+#     in the spec (marked "pending" where its consumer does not implement it yet) or goes through the
+#     `mox_lower` hook, which the spec provides for exactly this. Two spec gaps found while writing
+#     this sketch were fixed in specs/LSF2.md instead of left here: conditional template/hook
+#     alternatives in [semantics.bind] (§15.4) and per-archetype modifiers (`...` is rest vs spread,
+#     §15.5); also `str` roles with `delimited = false`, the LL(2) definition of the overlap check
+#     with rule-level `allow` (§11.8), and the operator-entry rule (§15.6).
+#
+#  B. Downstream gaps (the spec expresses them; a consumer must change). Each is listed in
+#     specs/LSF2.md §31 and filed in ISSUES.md: P20–P22 (HIR), P23 (OPS), P24 (lower-lang, with P15),
+#     P25 (unicode-lang), P14 (resolve-lang).
+#     HIR (HIR.md v3):
+#      1. No union or intersection type terms: `int|string`, `A&B`, DNF types (union_ty,
+#         intersection_ty are pending archetypes).
+#      2. Compound assignment admits only OPS ops: `.=`, `**=`, `%=` (PHP semantics), `<<=`, `>>=`,
+#         `??=` cannot evaluate their place once. Same for `++`/`--` templates that copy the place
+#         (`$a[f()]++` would call f more than once).
+#      3. The value of an assignment expression is not stated (PHP: the assigned value; `$a = $b = 1`
+#         and `if ($x = f())` depend on it).
+#      4. `Yield(v?)` has no key: `yield $k => $v`, and `yield from` forwarding keys.
+#      5. A `match` with no matching arm has no defined runtime error kind (Mox needs
+#         UnhandledMatchError).
+#      6. `not` is both logical and bitwise; on dynamic values bcgen-lang cannot tell `!` (LSB dlnot)
+#         from `~` (LSB dnot). This sketch uses an intrinsic for `~`; HIR should split the op.
+#     OPS:
+#      7. Shifts: PHP gives 0 (or -1) for amounts >= 64 and an error for negative amounts; OPS has
+#         only `error` and `mask`. `<<`/`>>` use intrinsics until OPS adds the policy.
+#      8. No `pow`: `**` is an intrinsic.
+#     lower-lang 0.3 (ISSUES P15 and new rows): interpolate and attribute archetypes; escape tables
+#      and heredoc dedent; [semantics.literals]; conditional templates (template_node_when);
+#      per-archetype modifiers; readonly; implicit receiver `$this`; function-scoped foreach/catch
+#      variables; numeric break levels; nested use trees; trait insteadof/as rules; `splice` with
+#      inherited modifiers (`public const A = 1, B = 2;`); template calls whose spliced arguments stay
+#      place arguments (isset/unset/?? must read places without a missing-key error); keyword type
+#      names (`array`, `callable`, `null`, `false`, `true`, `static`) and `void`; keyword tokens in WORD
+#      positions (`$o->list`) need the `name` role there; confirmation that `qualified_name` may be
+#      both a list-pick container and a `path`.
+#     resolve-lang: PHP's separate tables for class constants, static properties and methods
+#      (`Foo::$x`, `Foo::x()` and `Foo::X` can coexist) (ISSUES P14).
+#     bcgen-lang: `annotations = "runtime"` type checks; map_keys = "php"; the runtime hook table.
+#     Runtime kernel: request arenas, rc + cycle collection (gc-lang 2.0), COW ordered-map arrays
+#      (value-lang 2.0) — none built.
+#     unicode-lang: UAX #39 confusables (`confusables = "warn"`).
+#     Performance note (not a gap in expressiveness): PHP's comparison and concatenation semantics
+#      are intrinsics (`mox.loose_eq`, `mox.lt`, `mox.concat`); to meet Mox's speed goal bcgen-lang
+#      must inline their int/float/string fast paths rather than call the host every time.
+#
+#  C. Constructs lowered by the `mox_lower` hook (extension point 4) until HIR/lower-lang cover them:
+#     match expressions, switch, list()/[...] destructuring assignment, foreach by reference, enums,
+#     constructor property promotion, nullsafe `?->`, `$cls::f()`, `Foo::class`, magic constants,
+#     anonymous classes, `new static/self/parent`, keyed yield, array spread and by-reference array
+#     elements, bare-word keys in simple interpolation, nested use trees. That is the Mox Demo's
+#     (ROADMAP G3) largest single piece of language-specific work.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════

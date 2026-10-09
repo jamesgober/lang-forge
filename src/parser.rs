@@ -37,16 +37,16 @@
 
 use alloc::{format, string::String, vec::Vec};
 
-use diag_lang::{Diagnostic, Label, Severity};
+use diag_lang::{Code, Diagnostic, Label, Severity};
 use syntax_lang::{Node, Span, Token};
 
 use crate::{
-    grammar::{Expr, Grammar, Level, Program, RuleBody},
+    codes,
+    grammar::{CAT_CLASS, CAT_NODE, Expr, Grammar, Level, Program, RuleBody},
     kind::Kind,
-    lexer,
     schematic::Fixity,
     set::{NO_SET, SetId},
-    tree::{self, Event},
+    tree::{self, Event, Step},
 };
 
 /// How deeply the parser may recurse into the grammar before it reports an
@@ -60,35 +60,51 @@ use crate::{
 /// parentheses.
 pub(crate) const MAX_DEPTH: u32 = 768;
 
+/// No contextual keyword at this token.
+const NOT_KEYWORD: u16 = u16::MAX;
+
 /// Moves an event's forward link from one base index to another.
 #[inline]
 fn relocate(event: Event, from: u32, to: u32) -> Event {
-    match event {
-        Event::Start { kind, forward } if forward != 0 => Event::Start {
-            kind,
-            forward: forward - from + to,
-        },
-        other => other,
+    match event.step() {
+        Step::Start { kind, forward } if forward != 0 => Event::start(kind, forward - from + to),
+        _ => event,
     }
 }
 
 /// Parses `src`, always producing a tree, and the problems found on the way.
 pub(crate) fn parse(grammar: &Grammar, src: &str) -> (Node<Kind>, Vec<Diagnostic>) {
-    let root = grammar.program.rules[grammar.program.start as usize]
-        .node
-        .unwrap_or(grammar.program.error);
+    let program = &grammar.program;
     if u32::try_from(src.len()).is_err() {
+        let root = program.rules[program.start as usize]
+            .node
+            .unwrap_or(program.error);
         let diag = Diagnostic::new(
             Severity::Error,
             "the source is larger than 4 GiB",
             Label::unlabelled(Span::empty(0)),
-        );
+        )
+        .with_code(codes::SOURCE_TOO_LARGE);
         return (Node::new(root, Vec::new()), Vec::from([diag]));
     }
     let mut tokens = Vec::new();
     let mut diags = Vec::new();
     grammar.lexer.run(src, &mut tokens, &mut diags);
-    let mut parser = Parser::new(grammar, src, &tokens);
+    parse_tokens(grammar, src, &tokens, program.start, diags)
+}
+
+/// Parses already-lexed `tokens` of `src` with rule `start` as the root.
+pub(crate) fn parse_tokens(
+    grammar: &Grammar,
+    src: &str,
+    tokens: &[Token<Kind>],
+    start: u32,
+    mut diags: Vec<Diagnostic>,
+) -> (Node<Kind>, Vec<Diagnostic>) {
+    let program = &grammar.program;
+    let root = program.rules[start as usize].node.unwrap_or(program.error);
+    let mut parser = Parser::new(grammar, src, tokens);
+    parser.start = start;
     // Outside strict mode the parser recovers from everything; `top` only
     // reports failure to a strict caller.
     let recovered = parser.top();
@@ -102,7 +118,7 @@ pub(crate) fn parse(grammar: &Grammar, src: &str) -> (Node<Kind>, Vec<Diagnostic
         diags.extend(parse_diags);
         diags.sort_by_key(|d| d.primary().span().start().to_u32());
     }
-    (tree::build(&tokens, &mut events, root), diags)
+    (tree::build(tokens, &mut events, root, program.error), diags)
 }
 
 /// Parses `src` in strict mode only: `None` if it does not match the grammar
@@ -119,7 +135,12 @@ pub(crate) fn parse_strict(grammar: &Grammar, src: &str) -> Option<Node<Kind>> {
     }
     let root = grammar.program.rules[grammar.program.start as usize].node?;
     let mut events = parser.events;
-    Some(tree::build(&tokens, &mut events, root))
+    Some(tree::build(
+        &tokens,
+        &mut events,
+        root,
+        grammar.program.error,
+    ))
 }
 
 /// Parses `src` with memoization off: the reference memoized parsing must
@@ -139,7 +160,10 @@ pub(crate) fn parse_unmemoized(grammar: &Grammar, src: &str) -> (Node<Kind>, Vec
     let mut events = parser.events;
     diags.extend(parser.diags);
     diags.sort_by_key(|d| d.primary().span().start().to_u32());
-    (tree::build(&tokens, &mut events, root), diags)
+    (
+        tree::build(&tokens, &mut events, root, grammar.program.error),
+        diags,
+    )
 }
 
 /// A position to rewind to after a failed speculative attempt.
@@ -147,6 +171,7 @@ pub(crate) fn parse_unmemoized(grammar: &Grammar, src: &str) -> (Node<Kind>, Vec
 struct Checkpoint {
     events: usize,
     pos: usize,
+    marks: usize,
 }
 
 /// What a strict attempt at a rule produced, remembered by rule and position.
@@ -159,6 +184,10 @@ struct MemoEntry {
     end: u32,
     /// The furthest position the attempt looked at.
     reach: u32,
+    /// How many grammar levels below its own the attempt went: replaying it
+    /// is the same as parsing it again only where that many levels are left
+    /// before the depth limit (ISSUES P09).
+    deep: u32,
     /// Where the attempt's events are. While they are still in the parser's
     /// event list (`saved` unset), they are `from..from + len` there. Once a
     /// rewind has rescued them, they are items `from..from + len` of
@@ -459,6 +488,21 @@ struct Parser<'a> {
     /// Whether strict attempts are memoized. Always on; the tests turn it off
     /// to check that memoization never changes a result.
     memoize: bool,
+    /// The deepest grammar level the current attempt has reached.
+    max_depth: u32,
+    /// The rule the parse starts with.
+    start: u32,
+    /// By significant token: whether a line break precedes it (only when the
+    /// grammar uses `LINE_START` or `NL_BEFORE`).
+    nl_before: Vec<bool>,
+    /// By significant token: the contextual keyword an `IDENT` spells, or
+    /// `NOT_KEYWORD` (empty when the grammar has no contextual keywords).
+    contextual: Vec<u16>,
+    /// Tokens labelled in the current rule invocations, for text
+    /// back-references: (label, token position).
+    marks: Vec<(u16, u32)>,
+    /// Where the innermost rule invocation's marks begin.
+    mark_base: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -466,12 +510,62 @@ impl<'a> Parser<'a> {
         let significant = tokens.iter().filter(|t| !t.is_trivia()).count();
         let mut kinds = Vec::with_capacity(significant + 1);
         let mut spans = Vec::with_capacity(significant + 1);
-        for t in tokens.iter().filter(|t| !t.is_trivia()) {
-            kinds.push(t.kind().index() as u16);
+        let lines = grammar.program.v2.as_ref().is_some_and(|v| v.lines);
+        let mut nl_before = Vec::new();
+        let mut seen_break = true;
+        for t in tokens {
+            if t.is_trivia() {
+                if lines {
+                    let text = &src[t.span().start().to_usize()..t.span().end().to_usize()];
+                    seen_break |= text.contains('\n');
+                }
+                continue;
+            }
+            kinds.push(t.kind().index());
             spans.push(t.span());
+            if lines {
+                nl_before.push(seen_break);
+                // A line-break token itself ends a line.
+                seen_break = t.kind().index() == grammar.program.newline;
+            }
         }
         kinds.push(grammar.program.eof);
-        spans.push(Span::empty(src.len() as u32));
+        let end = spans
+            .last()
+            .map_or(0, |s: &Span| s.end().to_u32())
+            .max(tokens.last().map_or(0, |t| t.span().end().to_u32()));
+        spans.push(Span::empty(end));
+        if lines {
+            nl_before.push(seen_break);
+        }
+        let mut contextual = Vec::new();
+        if let Some(v2) = grammar
+            .program
+            .v2
+            .as_ref()
+            .filter(|v| !v.contextual.is_empty())
+        {
+            let ident = grammar.program.ident;
+            contextual.reserve(kinds.len());
+            let mut buf = String::new();
+            for (k, span) in kinds.iter().zip(&spans) {
+                let mut keyword = NOT_KEYWORD;
+                if *k == ident {
+                    let text = &src[span.start().to_usize()..span.end().to_usize()];
+                    let text = if v2.case_insensitive {
+                        buf.clear();
+                        buf.extend(text.chars().map(|c| c.to_ascii_lowercase()));
+                        buf.as_str()
+                    } else {
+                        text
+                    };
+                    if let Ok(at) = v2.contextual.binary_search_by(|(t, _)| (**t).cmp(text)) {
+                        keyword = v2.contextual[at].1;
+                    }
+                }
+                contextual.push(keyword);
+            }
+        }
         Self {
             grammar,
             program: &grammar.program,
@@ -494,6 +588,12 @@ impl<'a> Parser<'a> {
             taint: 0,
             memo: Memo::default(),
             memoize: true,
+            max_depth: 0,
+            start: grammar.program.start,
+            nl_before,
+            contextual,
+            marks: Vec::new(),
+            mark_base: 0,
         }
     }
 
@@ -501,13 +601,10 @@ impl<'a> Parser<'a> {
     /// mode, when the input does not match.
     fn top(&mut self) -> bool {
         let program = self.program;
-        let start = program.start;
+        let start = self.start;
         let rule = &program.rules[start as usize];
         let root = rule.node.unwrap_or(self.program.error);
-        self.events.push(Event::Start {
-            kind: root,
-            forward: 0,
-        });
+        self.events.push(Event::start(root, 0));
         let ok = if self.at_set(rule.first) || rule.nullable {
             self.active[start as usize] = 0;
             match rule.body {
@@ -526,7 +623,7 @@ impl<'a> Parser<'a> {
             }
             self.leftover();
         }
-        self.events.push(Event::Finish);
+        self.events.push(Event::FINISH);
         true
     }
 
@@ -543,6 +640,7 @@ impl<'a> Parser<'a> {
             return self.too_deep();
         }
         self.depth += 1;
+        self.max_depth = self.max_depth.max(self.depth);
         let ok = match expr {
             Expr::Rule(r) => self.rule(r),
             Expr::Seq { start, len } => self.seq(start, len),
@@ -552,11 +650,157 @@ impl<'a> Parser<'a> {
                 min_one,
                 stop,
             } => self.repeat(body, min_one, stop),
-            Expr::Optional(body) => !self.at_set(program.first[body as usize]) || self.expr(body),
+            Expr::Optional(body) => {
+                !self.at_set(program.first[body as usize]) || !self.guard(body) || self.expr(body)
+            }
             Expr::Token(_) => true,
+            other => self.expr_v2(e, other),
         };
         self.depth -= 1;
         ok
+    }
+
+    /// The format-2 expressions.
+    #[inline(never)]
+    fn expr_v2(&mut self, e: u32, expr: Expr) -> bool {
+        match expr {
+            Expr::Keyword(kind) => {
+                if self.current() == kind {
+                    self.bump();
+                    return true;
+                }
+                if self.current() == self.program.ident && self.is_keyword_text(kind, self.pos) {
+                    self.bump_as(kind);
+                    return true;
+                }
+                self.missing_token(kind)
+            }
+            Expr::Word => {
+                if self.at_set(self.program.first[e as usize]) && !self.at_eof() {
+                    self.bump();
+                    return true;
+                }
+                self.expected_word()
+            }
+            Expr::Label { label, body } => {
+                self.events.push(Event::label(label));
+                let before = self.pos;
+                let ok = self.expr(body);
+                self.events.push(Event::UNLABEL);
+                if ok && self.pos > before && self.program.v2.as_ref().is_some_and(|v| v.backrefs) {
+                    self.marks.push((label, self.pos as u32 - 1));
+                }
+                ok
+            }
+            Expr::And(body) => {
+                if self.lookahead(body) {
+                    return true;
+                }
+                self.failed_predicate(body, true)
+            }
+            Expr::Not(body) => {
+                if !self.lookahead(body) {
+                    return true;
+                }
+                self.failed_predicate(body, false)
+            }
+            Expr::BackRef { label, body } => self.backref(label, body),
+            Expr::Eof => self.at_eof() || self.expected_eof(),
+            Expr::LineStart | Expr::NlBefore => {
+                let at = self.pos;
+                let ok = self.nl_before.get(at).copied().unwrap_or(false)
+                    || (matches!(expr, Expr::LineStart) && at == 0);
+                ok || self.failed_assertion(matches!(expr, Expr::LineStart))
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether significant token `pos` is an `IDENT` spelling contextual
+    /// keyword `kind`, under the keyword case policy.
+    fn is_keyword_text(&self, kind: u16, pos: usize) -> bool {
+        self.contextual.get(pos) == Some(&kind)
+    }
+
+    /// Whether a repetition or optional whose body begins with a predicate
+    /// may commit: the predicate is asked first (format 2).
+    #[inline]
+    fn guard(&mut self, body: u32) -> bool {
+        if !self.program.v2.as_ref().is_some_and(|v| v.predicates) {
+            return true;
+        }
+        let mut e = body;
+        loop {
+            match self.program.exprs[e as usize] {
+                Expr::And(inner) => return self.lookahead(inner),
+                Expr::Not(inner) => return !self.lookahead(inner),
+                Expr::Seq { start, len } if len > 0 => e = self.program.items[start as usize],
+                Expr::Label { body, .. } => e = body,
+                _ => return true,
+            }
+        }
+    }
+
+    /// Whether `e` would match here, without consuming input or recording
+    /// anything: a strict attempt, rewound.
+    fn lookahead(&mut self, e: u32) -> bool {
+        let checkpoint = self.checkpoint();
+        let outermost = self.speculating == 0;
+        if outermost {
+            self.hit_limit = false;
+        }
+        self.speculating += 1;
+        self.strict += 1;
+        let furthest = self.furthest;
+        let ok = self.expr(e);
+        self.furthest = furthest;
+        self.strict -= 1;
+        self.speculating -= 1;
+        self.restore(checkpoint);
+        if outermost {
+            self.memo.clear();
+            self.hit_limit = false;
+        }
+        ok
+    }
+
+    fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            events: self.events.len(),
+            pos: self.pos,
+            marks: self.marks.len(),
+        }
+    }
+
+    fn restore(&mut self, checkpoint: Checkpoint) {
+        self.rewind(checkpoint.events);
+        self.pos = checkpoint.pos;
+        self.marks.truncate(checkpoint.marks);
+    }
+
+    /// `body=label`: the token's text must equal the text of the token last
+    /// labelled `label` in this rule invocation.
+    fn backref(&mut self, label: u16, body: u32) -> bool {
+        let want = self.marks[self.mark_base..]
+            .iter()
+            .rev()
+            .find(|(l, _)| *l == label)
+            .map(|(_, at)| *at as usize);
+        let same = want.is_some_and(|at| {
+            let (a, b) = (self.text(at), self.text(self.pos));
+            a == b
+                || (self.program.v2.as_ref().is_some_and(|v| v.case_insensitive)
+                    && self.program.exprs[body as usize] != Expr::Token(self.program.ident)
+                    && a.eq_ignore_ascii_case(b))
+        });
+        if same {
+            return self.expr(body);
+        }
+        if self.strict > 0 {
+            return false;
+        }
+        self.mismatch(want);
+        self.expr(body)
     }
 
     fn seq(&mut self, start: u32, len: u32) -> bool {
@@ -606,17 +850,25 @@ impl<'a> Parser<'a> {
             return self.rule_body(r, pos);
         }
         if let Some((index, hit)) = self.memo.get(r, self.pos) {
-            return self.replay(index, hit);
+            // P09: a result remembered with more levels to spare than are
+            // left here could differ from parsing it again; parse it again.
+            if self.depth + hit.deep <= MAX_DEPTH {
+                return self.replay(index, hit);
+            }
         }
         let first_event = self.events.len();
         let taint = self.taint;
         let outer = self.furthest;
         self.furthest = self.pos;
+        let outer_depth = self.max_depth;
+        self.max_depth = self.depth;
         let ok = self.rule_body(r, pos);
+        let deep = self.max_depth - self.depth;
+        self.max_depth = outer_depth.max(self.max_depth);
         let reach = self.furthest;
         self.furthest = outer.max(reach);
         if self.taint == taint {
-            self.remember(r, pos, first_event, ok, reach);
+            self.remember(r, pos, first_event, ok, reach, deep);
         }
         ok
     }
@@ -627,14 +879,24 @@ impl<'a> Parser<'a> {
         let rule = &self.program.rules[r as usize];
         let outer = core::mem::replace(&mut self.active[r as usize], pos);
         if let Some(kind) = rule.node {
-            self.events.push(Event::Start { kind, forward: 0 });
+            self.events.push(Event::start(kind, 0));
+        }
+        let base = core::mem::replace(&mut self.mark_base, self.marks.len());
+        let sync = rule.sync != NO_SET && self.strict == 0;
+        if sync {
+            self.stops.push(rule.sync);
         }
         let ok = match rule.body {
             RuleBody::Expr(e) => self.expr(e),
             RuleBody::Pratt(p) => self.pratt(p, r, 0),
         };
+        if sync {
+            let _ = self.stops.pop();
+        }
+        self.marks.truncate(self.mark_base);
+        self.mark_base = base;
         if ok && rule.node.is_some() {
-            self.events.push(Event::Finish);
+            self.events.push(Event::FINISH);
         }
         self.active[r as usize] = outer;
         ok
@@ -642,12 +904,21 @@ impl<'a> Parser<'a> {
 
     /// Records a strict attempt's outcome. A success's events stay where
     /// they are, at the end of the event list, and the entry points at them.
-    fn remember(&mut self, rule: u32, pos: u32, first_event: usize, ok: bool, reach: usize) {
+    fn remember(
+        &mut self,
+        rule: u32,
+        pos: u32,
+        first_event: usize,
+        ok: bool,
+        reach: usize,
+        deep: u32,
+    ) {
         let mut entry = MemoEntry {
             rule,
             next: 0,
             end: FAILED,
             reach: reach as u32,
+            deep,
             from: 0,
             len: 0,
             origin: 0,
@@ -718,10 +989,7 @@ impl<'a> Parser<'a> {
 
     fn try_alternatives(&mut self, alternatives: &[u32]) -> bool {
         let program = self.program;
-        let checkpoint = Checkpoint {
-            events: self.events.len(),
-            pos: self.pos,
-        };
+        let checkpoint = self.checkpoint();
         let mut best: Option<(u32, usize)> = None;
         for &alt in alternatives {
             if !program.nullable[alt as usize] && !self.at_set(program.first[alt as usize]) {
@@ -740,8 +1008,7 @@ impl<'a> Parser<'a> {
             if best.is_none_or(|(_, r)| reach > r) {
                 best = Some((alt, reach));
             }
-            self.rewind(checkpoint.events);
-            self.pos = checkpoint.pos;
+            self.restore(checkpoint);
             // Results that hit the depth limit cannot be memoized, so trying
             // every alternative at every level of such input would take
             // exponential time. The input is reported as too deep regardless;
@@ -775,7 +1042,7 @@ impl<'a> Parser<'a> {
             self.stops.push(stop);
         }
         loop {
-            if self.at_set(first) {
+            if self.at_set(first) && self.guard(body) {
                 let before = self.pos;
                 if !self.expr(body) {
                     return false;
@@ -791,11 +1058,7 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
-            if !recovering
-                || self.at_eof()
-                || program.sets.contains(stop, self.current() as usize)
-                || self.at_outer_stop()
-            {
+            if !recovering || self.at_eof() || self.in_stop(stop) || self.at_outer_stop() {
                 break;
             }
             self.unexpected_item(body);
@@ -811,32 +1074,80 @@ impl<'a> Parser<'a> {
             return self.too_deep();
         }
         self.depth += 1;
+        self.max_depth = self.max_depth.max(self.depth);
         let ok = self.pratt_inner(p, rule, min_bp);
         self.depth -= 1;
         ok
     }
 
+    /// The operator level `pratt` gives the current token, if any: from the
+    /// `prefix` (or infix/postfix) table, or, for an `IDENT`, a contextual
+    /// keyword operator with that text. The second value is the keyword kind
+    /// to record the token as.
+    fn operator(&self, p: u32, prefix: bool) -> (u8, Option<u16>) {
+        let pratt = &self.program.pratts[p as usize];
+        let current = self.current();
+        let table = if prefix { &pratt.prefix } else { &pratt.after };
+        let level = table.get(current as usize).copied().unwrap_or(0);
+        if level != 0 || pratt.contextual.is_empty() || current != self.program.ident {
+            return (level, None);
+        }
+        for &(kind, pre, after) in pratt.contextual.iter() {
+            let level = if prefix { pre } else { after };
+            if level != 0 && self.is_keyword_text(kind, self.pos) {
+                // A keyword operator before something that cannot follow an
+                // operator is an ordinary identifier (`await;`).
+                let next = self
+                    .kinds
+                    .get(self.pos + 1)
+                    .copied()
+                    .unwrap_or(self.program.eof);
+                let rule_first = self.program.rules.iter().find_map(|r| match r.body {
+                    RuleBody::Pratt(q) if q == p => Some(r.first),
+                    _ => None,
+                });
+                let fits = !prefix
+                    || rule_first.is_some_and(|f| self.program.sets.contains(f, next as usize));
+                if fits {
+                    return (level, Some(kind));
+                }
+            }
+        }
+        (0, None)
+    }
+
     fn pratt_inner(&mut self, p: u32, rule: u32, min_bp: u16) -> bool {
         let program = self.program;
         let pratt = &program.pratts[p as usize];
-        // A placeholder for the node that will wrap this operand, if any.
+        // Format 2 labels the children of operator nodes.
+        let labels = program.v2.as_ref().map(|v| v.op_labels);
+        // A placeholder for the node that will wrap this operand, if any (and,
+        // with labels, one for the `lhs` scope around the operand).
         let slot = self.events.len();
-        self.events.push(Event::Tombstone);
+        self.events.push(Event::TOMBSTONE);
+        if labels.is_some() {
+            self.events.push(Event::TOMBSTONE);
+        }
         let mut outer = slot;
 
-        let current = self.current() as usize;
-        let prefix = pratt.prefix.get(current).copied().unwrap_or(0);
+        let (prefix, keyword) = self.operator(p, true);
         if prefix != 0 {
             let level = pratt.levels[prefix as usize - 1];
-            self.events[slot] = Event::Start {
-                kind: level.node,
-                forward: 0,
-            };
-            self.bump();
-            if !self.operator_tail(level) || !self.pratt(p, rule, level.rbp) {
+            self.events[slot] = Event::start(level.node, 0);
+            self.operator_token(labels, keyword);
+            if !self.operator_tail(level) {
                 return false;
             }
-            self.events.push(Event::Finish);
+            if let Some([.., operand]) = labels {
+                self.events.push(Event::label(operand));
+            }
+            if !self.pratt(p, rule, level.rbp) {
+                return false;
+            }
+            if labels.is_some() {
+                self.events.push(Event::UNLABEL);
+            }
+            self.events.push(Event::FINISH);
         } else if self.at_set(program.first[pratt.operand as usize]) {
             if !self.expr(pratt.operand) {
                 return false;
@@ -847,11 +1158,7 @@ impl<'a> Parser<'a> {
 
         let mut chained: Option<u8> = None;
         loop {
-            let index = pratt
-                .after
-                .get(self.current() as usize)
-                .copied()
-                .unwrap_or(0);
+            let (index, keyword) = self.operator(p, false);
             if index == 0 {
                 break;
             }
@@ -862,18 +1169,41 @@ impl<'a> Parser<'a> {
             if level.fixity == Fixity::NonAssoc && chained == Some(index) && !self.chained() {
                 return false;
             }
-            self.wrap(slot, &mut outer, level.node);
-            self.bump();
+            self.wrap(slot, &mut outer, level.node, labels);
+            self.operator_token(labels, keyword);
             if !self.operator_tail(level) {
                 return false;
             }
-            if level.fixity != Fixity::Postfix && !self.pratt(p, rule, level.rbp) {
-                return false;
+            if level.fixity != Fixity::Postfix {
+                if let Some([_, _, rhs, _]) = labels {
+                    self.events.push(Event::label(rhs));
+                }
+                if !self.pratt(p, rule, level.rbp) {
+                    return false;
+                }
+                if labels.is_some() {
+                    self.events.push(Event::UNLABEL);
+                }
             }
-            self.events.push(Event::Finish);
+            self.events.push(Event::FINISH);
             chained = (level.fixity == Fixity::NonAssoc).then_some(index);
         }
         true
+    }
+
+    /// Consumes an operator token, labelled `op` in format 2, recorded as
+    /// `keyword` when it is a contextual keyword.
+    fn operator_token(&mut self, labels: Option<[u16; 4]>, keyword: Option<u16>) {
+        if let Some([_, op, ..]) = labels {
+            self.events.push(Event::label(op));
+        }
+        match keyword {
+            Some(kind) => self.bump_as(kind),
+            None => self.bump(),
+        }
+        if labels.is_some() {
+            self.events.push(Event::UNLABEL);
+        }
     }
 
     /// The `then` part of an operator level, if it has one.
@@ -881,16 +1211,25 @@ impl<'a> Parser<'a> {
         level.then.is_none_or(|then| self.expr(then))
     }
 
-    /// Opens a node of `kind` around everything since `slot`.
-    fn wrap(&mut self, slot: usize, outer: &mut usize, kind: Kind) {
-        if matches!(self.events[slot], Event::Tombstone) {
-            self.events[slot] = Event::Start { kind, forward: 0 };
+    /// Opens a node of `kind` around everything since `slot`. With labels,
+    /// what it wraps becomes its `lhs` (or `operand`, for postfix).
+    fn wrap(&mut self, slot: usize, outer: &mut usize, kind: Kind, labels: Option<[u16; 4]>) {
+        if self.events[slot] == Event::TOMBSTONE {
+            self.events[slot] = Event::start(kind, 0);
+            if let Some([lhs, ..]) = labels {
+                self.events[slot + 1] = Event::label(lhs);
+                self.events.push(Event::UNLABEL);
+            }
             return;
         }
         let new = self.events.len();
-        self.events.push(Event::Start { kind, forward: 0 });
-        if let Event::Start { forward, .. } = &mut self.events[*outer] {
-            *forward = new as u32;
+        self.events.push(Event::start(kind, 0));
+        if let Step::Start { kind: wrapped, .. } = self.events[*outer].step() {
+            let wrapped = match labels {
+                Some([lhs, ..]) => wrapped.with_label(Some(lhs)),
+                None => wrapped,
+            };
+            self.events[*outer] = Event::start(wrapped, new as u32);
         }
         *outer = new;
     }
@@ -915,19 +1254,42 @@ impl<'a> Parser<'a> {
         let sets = &self.program.sets;
         let current = self.current();
         sets.contains(set, current as usize)
-            || (current == self.program.eof && sets.contains(set, lexer::NEWLINE as usize))
+            || (current == self.program.eof && sets.contains(set, self.program.newline as usize))
+            || self.keyword_in(set)
+    }
+
+    /// Whether the current token is an `IDENT` spelling a contextual keyword
+    /// that is in `set` (format 2).
+    #[inline]
+    fn keyword_in(&self, set: SetId) -> bool {
+        !self.contextual.is_empty()
+            && self
+                .contextual
+                .get(self.pos)
+                .is_some_and(|&k| k != NOT_KEYWORD && self.program.sets.contains(set, k as usize))
+    }
+
+    /// Whether the current token is in stop set `set`.
+    #[inline]
+    fn in_stop(&self, set: SetId) -> bool {
+        self.program.sets.contains(set, self.current() as usize) || self.keyword_in(set)
     }
 
     fn at_outer_stop(&self) -> bool {
-        let current = self.current() as usize;
-        self.stops
-            .iter()
-            .any(|&s| self.program.sets.contains(s, current))
+        self.stops.iter().any(|&s| self.in_stop(s))
     }
 
     #[inline]
     fn bump(&mut self) {
-        self.events.push(Event::Token);
+        self.events.push(Event::TOKEN);
+        self.pos += 1;
+        self.furthest = self.furthest.max(self.pos);
+    }
+
+    /// Consumes the current token, recording it as keyword `kind`.
+    fn bump_as(&mut self, kind: u16) {
+        let kind = self.grammar.kinds.at(kind as usize);
+        self.events.push(Event::token_as(kind));
         self.pos += 1;
         self.furthest = self.furthest.max(self.pos);
     }
@@ -939,13 +1301,10 @@ impl<'a> Parser<'a> {
             let _ = self.events.pop();
             self.bump();
         } else {
-            self.events.push(Event::Start {
-                kind: self.program.error,
-                forward: 0,
-            });
+            self.events.push(Event::start(self.program.error, 0));
             self.bump();
         }
-        self.events.push(Event::Finish);
+        self.events.push(Event::FINISH);
         self.error_end = self.events.len();
     }
 
@@ -964,7 +1323,7 @@ impl<'a> Parser<'a> {
     fn missing_token(&mut self, kind: u16) -> bool {
         // The end of the input ends the last line too, so a file need not
         // finish with a line break.
-        if kind == lexer::NEWLINE && self.at_eof() {
+        if kind == self.program.newline && self.at_eof() {
             return true;
         }
         if self.strict > 0 {
@@ -978,6 +1337,79 @@ impl<'a> Parser<'a> {
             self.bump();
         }
         true
+    }
+
+    /// `WORD` found something else.
+    #[cold]
+    #[inline(never)]
+    fn expected_word(&mut self) -> bool {
+        if self.strict > 0 {
+            return false;
+        }
+        let message = format!("expected an identifier or keyword, found {}", self.found());
+        self.report(message);
+        true
+    }
+
+    /// A predicate that failed outside speculation: reported, and the parse
+    /// carries on as if it had held.
+    #[cold]
+    #[inline(never)]
+    fn failed_predicate(&mut self, body: u32, positive: bool) -> bool {
+        if self.strict > 0 {
+            return false;
+        }
+        let message = if positive {
+            format!(
+                "expected {}, found {}",
+                self.describe_expr(body),
+                self.found()
+            )
+        } else {
+            format!("{} is not allowed here", capitalize(&self.found()))
+        };
+        self.report(message);
+        true
+    }
+
+    /// `EOF` found more input.
+    #[cold]
+    #[inline(never)]
+    fn expected_eof(&mut self) -> bool {
+        if self.strict > 0 {
+            return false;
+        }
+        let message = format!("expected the end of the input, found {}", self.found());
+        self.report(message);
+        true
+    }
+
+    /// `LINE_START` or `NL_BEFORE` did not hold.
+    #[cold]
+    #[inline(never)]
+    fn failed_assertion(&mut self, line_start: bool) -> bool {
+        if self.strict > 0 {
+            return false;
+        }
+        let message = if line_start {
+            format!("expected {} to begin a line", self.found())
+        } else {
+            format!("expected a line break before {}", self.found())
+        };
+        self.report(message);
+        true
+    }
+
+    /// A text back-reference whose text differs from the labelled token's.
+    #[cold]
+    #[inline(never)]
+    fn mismatch(&mut self, want: Option<usize>) {
+        let found = self.text(self.pos);
+        let message = match want {
+            Some(at) => format!("`{found}` does not match `{}`", self.text(at)),
+            None => format!("`{found}` has nothing earlier to match"),
+        };
+        self.report_code(codes::PARSE_MISMATCH, message);
     }
 
     /// The current token cannot begin rule `r`.
@@ -1044,7 +1476,7 @@ impl<'a> Parser<'a> {
             "`{}` cannot be chained; add parentheses",
             self.text(self.pos)
         );
-        self.report(message);
+        self.report_code(codes::PARSE_CHAINED, message);
         true
     }
 
@@ -1065,28 +1497,27 @@ impl<'a> Parser<'a> {
     #[inline(never)]
     fn leftover(&mut self) {
         let message = format!("expected the end of the input, found {}", self.found());
-        self.report(message);
-        self.events.push(Event::Start {
-            kind: self.program.error,
-            forward: 0,
-        });
+        self.report_code(codes::PARSE_LEFTOVER, message);
+        self.events.push(Event::start(self.program.error, 0));
         while !self.at_eof() {
             self.bump();
         }
-        self.events.push(Event::Finish);
+        self.events.push(Event::FINISH);
     }
 
     fn report(&mut self, message: String) {
+        self.report_code(codes::PARSE_EXPECTED, message);
+    }
+
+    fn report_code(&mut self, code: Code, message: String) {
         if self.last_error == self.pos {
             return;
         }
         self.last_error = self.pos;
         let span = self.spans[self.pos];
-        self.diags.push(Diagnostic::new(
-            Severity::Error,
-            message,
-            Label::unlabelled(span),
-        ));
+        self.diags.push(
+            Diagnostic::new(Severity::Error, message, Label::unlabelled(span)).with_code(code),
+        );
     }
 
     #[cold]
@@ -1106,7 +1537,7 @@ impl<'a> Parser<'a> {
                     "the input is nested too deeply to parse (more than {MAX_DEPTH} grammar levels)"
                 ),
                 Label::unlabelled(span),
-            ));
+            ).with_code(codes::PARSE_TOO_DEEP));
         }
         true
     }
@@ -1126,23 +1557,35 @@ impl<'a> Parser<'a> {
         let text = self.text(self.pos);
         let short: String = text.chars().take(32).collect();
         let ellipsis = if short.len() < text.len() { "…" } else { "" };
+        let program = self.program;
         match kind {
-            lexer::IDENT => format!("identifier `{short}{ellipsis}`"),
-            lexer::NUMBER => format!("number `{short}{ellipsis}`"),
-            lexer::STRING => String::from("a string"),
-            lexer::NEWLINE => String::from("a line break"),
+            k if k == program.ident => format!("identifier `{short}{ellipsis}`"),
+            k if k == program.number => format!("number `{short}{ellipsis}`"),
+            k if program.strings.contains(&k) => String::from("a string"),
+            k if k == program.newline => String::from("a line break"),
+            k if self.grammar.kinds.cats.get(k as usize) == Some(&CAT_CLASS) && text.is_empty() => {
+                String::from(self.grammar.kinds.name_at(k as usize))
+            }
             _ => format!("`{short}{ellipsis}`"),
         }
     }
 
     /// A token kind, for "expected ...".
     fn describe(&self, kind: u16) -> String {
+        let program = self.program;
         match kind {
-            lexer::IDENT => String::from("an identifier"),
-            lexer::NUMBER => String::from("a number"),
-            lexer::STRING => String::from("a string"),
-            lexer::NEWLINE => String::from("a line break"),
-            k if k == self.program.eof => String::from("the end of the input"),
+            k if k == program.ident => String::from("an identifier"),
+            k if k == program.number => String::from("a number"),
+            k if program.strings.contains(&k) => String::from("a string"),
+            k if k == program.newline => String::from("a line break"),
+            k if k == program.eof => String::from("the end of the input"),
+            k if matches!(
+                self.grammar.kinds.cats.get(k as usize),
+                Some(&CAT_CLASS | &CAT_NODE)
+            ) =>
+            {
+                String::from(self.grammar.kinds.name_at(k as usize))
+            }
             k => format!("`{}`", self.grammar.kinds.name_at(k as usize)),
         }
     }
@@ -1150,8 +1593,12 @@ impl<'a> Parser<'a> {
     fn describe_expr(&self, e: u32) -> String {
         match self.program.exprs[e as usize] {
             Expr::Rule(r) => String::from(&*self.program.rules[r as usize].name),
-            Expr::Token(kind) => self.describe(kind),
-            Expr::Repeat { body, .. } | Expr::Optional(body) => self.describe_expr(body),
+            Expr::Token(kind) | Expr::Keyword(kind) => self.describe(kind),
+            Expr::Repeat { body, .. }
+            | Expr::Optional(body)
+            | Expr::Label { body, .. }
+            | Expr::And(body)
+            | Expr::BackRef { body, .. } => self.describe_expr(body),
             _ => self.describe_sets(&[self.program.first[e as usize]]),
         }
     }
@@ -1179,6 +1626,15 @@ impl<'a> Parser<'a> {
             2 => format!("{} or {}", names[0], names[1]),
             n => format!("{}, or {}", names[..n - 1].join(", "), names[n - 1]),
         }
+    }
+}
+
+/// `text` with its first letter in upper case.
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -1614,6 +2070,194 @@ mod tests {
                 .unwrap();
             handle.join().unwrap();
         }
+    }
+
+    // ----- format 2 -----
+
+    /// A format-2 grammar using every parser feature format 2 adds: labels
+    /// (on tokens, nodes, groups), predicates, a text back-reference,
+    /// contextual keywords (in rules and as Pratt operators), case-folded
+    /// keywords, interpolated strings with a rule inside, and ordered
+    /// choice that speculates across rules.
+    fn v2_language() -> Language {
+        let sketch = "[sketch]\nformat = 2\n[language]\nname = \"v\"\nversion = \"1.0.0\"\n\
+             [lexer]\nline_comments = [\"#\"]\n\
+             [lexer.keywords]\ncontextual = [\"async\", \"await\", \"is\"]\ncase = \"ascii-insensitive\"\n\
+             [lexer.strings.DQ]\nopen = '\"'\nescape = \"\\\\\"\ninterpolate = [{ open = \"{\", close = \"}\", rule = \"expr\" }]\n\
+             [rules]\nfile = \"items:stmt*\"\n\
+             stmt = \"assign | fn_def | block_stmt | value:expr ';' | 'let' name:IDENT ';'\"\n\
+             assign = \"target:expr '=' value:expr ';'\"\n\
+             fn_def = \"'async'? 'fn' name:IDENT '(' (params:IDENT (',' params:IDENT)*)? ')' body:block\"\n\
+             block_stmt = \"'begin' tag:IDENT body:stmt* 'end' IDENT=tag ';'\"\n\
+             block = \"'{' stmts:stmt* '}'\"\n\
+             call = \"callee:IDENT !'=' '(' (args:expr (',' args:expr)*)? ')'\"\n\
+             [rules.expr]\noperand = \"call | IDENT | NUMBER | DQ | block\"\n\
+             levels = [{ left = [\"is\"] }, { left = [\"+\"] }, { prefix = [\"-\", \"await\"] }]\n";
+        Language::from_lsf(sketch).unwrap_or_else(|e| panic!("{e}\n{:?}", e.diagnostics()))
+    }
+
+    const V2_WORDS: [&str; 26] = [
+        "x",
+        "f",
+        "1",
+        "=",
+        ";",
+        "{",
+        "}",
+        "(",
+        ")",
+        ",",
+        "+",
+        "-",
+        "let",
+        "async",
+        "await",
+        "is",
+        "fn",
+        "FN",
+        "begin",
+        "end",
+        "\"a {x} b\"",
+        "\"",
+        "{x",
+        "# c\n",
+        "\\",
+        "IS",
+    ];
+
+    /// The tree as text, with every kind and label: trees that differ only
+    /// in a label differ here (kinds compare equal regardless of labels).
+    fn labelled_dump(lang: &Language, node: &Node<Kind>) -> String {
+        fn walk(lang: &Language, node: &Node<Kind>, depth: usize, out: &mut String) {
+            out.push_str(&format!(
+                "{depth}:{:?}:{}@{:?}\n",
+                node.kind().label(),
+                lang.kind_name(*node.kind()),
+                node.span()
+            ));
+            for child in node.children() {
+                match child {
+                    syntax_lang::Element::Node(n) => walk(lang, n, depth + 1, out),
+                    syntax_lang::Element::Token(t) => {
+                        out.push_str(&format!(
+                            "{}:{:?}:{}@{:?}\n",
+                            depth + 1,
+                            t.kind().label(),
+                            lang.kind_name(*t.kind()),
+                            t.span()
+                        ));
+                    }
+                }
+            }
+        }
+        // The test inputs nest a few dozen levels at most.
+        let mut out = String::new();
+        walk(lang, node, 0, &mut out);
+        out
+    }
+
+    #[test]
+    fn test_v2_samples_agree_with_strict() {
+        let lang = v2_language();
+        for src in [
+            "let x; x = f(1, -2) + 3; async fn g(a, b) { await g(1); }",
+            "begin a x; begin b end b; end a; \"s {x + 1} t\";",
+            "async = 1; await; x is f(1) is 2; FN h() { }",
+        ] {
+            let parse = lang.parse(src);
+            assert!(!parse.has_errors(), "{src:?}: {:?}", messages(&lang, src));
+            let strict = parse_strict(lang.grammar(), src).expect("strict parse succeeds");
+            assert_eq!(
+                labelled_dump(&lang, &strict),
+                labelled_dump(&lang, parse.tree())
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(cases()))]
+
+        /// Format 2: lossless, labels included in the strict agreement.
+        #[test]
+        fn prop_v2_parse_is_lossless_and_agrees_with_strict(words in proptest::collection::vec(0..V2_WORDS.len(), 0..40)) {
+            let lang = v2_language();
+            let src: String = words.iter().map(|&w| V2_WORDS[w]).collect::<Vec<_>>().join(" ");
+            let parse = lang.parse(&src);
+            prop_assert_eq!(parse.tree().text(&src), Some(src.as_str()));
+            prop_assert_eq!(parse.tree().span(), Span::new(0, src.len() as u32));
+            let strict = parse_strict(lang.grammar(), &src);
+            // Lexical errors (an unknown character, an unterminated string)
+            // are the lexer's; strict mode judges the grammar only.
+            let parse_errors = parse
+                .diagnostics()
+                .iter()
+                .any(|d| d.code().is_some_and(|c| c.to_string().starts_with("LF1")));
+            if parse_errors {
+                prop_assert!(strict.is_none(), "strict accepted input with errors: {:?}", src);
+            } else {
+                let strict = strict.expect("strict agrees");
+                prop_assert_eq!(labelled_dump(&lang, &strict), labelled_dump(&lang, parse.tree()), "trees differ for {:?}", src);
+            }
+        }
+
+        /// Format 2: memoization is invisible, labels included.
+        #[test]
+        fn prop_v2_memoization_never_changes_a_result(words in proptest::collection::vec(0..V2_WORDS.len(), 0..40)) {
+            let lang = v2_language();
+            let src: String = words.iter().map(|&w| V2_WORDS[w]).collect::<Vec<_>>().join(" ");
+            let memoized = parse(lang.grammar(), &src);
+            let plain = parse_unmemoized(lang.grammar(), &src);
+            prop_assert_eq!(labelled_dump(&lang, &memoized.0), labelled_dump(&lang, &plain.0), "trees differ for {:?}", src);
+            prop_assert_eq!(memoized.1, plain.1, "diagnostics differ for {:?}", src);
+        }
+
+        #[test]
+        fn prop_v2_arbitrary_text_never_panics(src in "\\PC{0,80}") {
+            let lang = v2_language();
+            let parse = lang.parse(&src);
+            prop_assert_eq!(parse.tree().text(&src), Some(src.as_str()));
+        }
+    }
+
+    /// ISSUES P09: a rule remembered at a shallow depth must not be replayed
+    /// where parsing it would pass the depth limit. Here `x` is parsed
+    /// under `a` (depth d) and memoized, then needed again under `b`, two
+    /// levels deeper; near the limit, replaying it would accept input that
+    /// the unmemoized parser reports as nested too deeply. Memoized and
+    /// unmemoized parsing agree at every nesting around the limit.
+    #[test]
+    fn test_memo_replay_respects_the_depth_limit() {
+        let lang = forge(
+            "[rules]\ns = \"a | b\"\na = \"x 'q'\"\nb = \"w\"\nw = \"v\"\nv = \"x 'r'\"\nx = \"'(' x ')' | 'z'\"\n",
+        );
+        // One parenthesis costs several grammar levels, so the nestings tried
+        // start well below the limit; without the P09 check they differ
+        // from nesting 254 on.
+        let limit = MAX_DEPTH as usize;
+        let handle = std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                let mut deep = 0;
+                for n in (limit / 4)..(limit + 4) {
+                    let src = format!("{}z{} r", "(".repeat(n), ")".repeat(n));
+                    let memoized = parse(lang.grammar(), &src);
+                    let plain = parse_unmemoized(lang.grammar(), &src);
+                    assert_eq!(memoized.0, plain.0, "trees differ at nesting {n}");
+                    assert_eq!(memoized.1, plain.1, "diagnostics differ at nesting {n}");
+                    assert_eq!(memoized.0.text(&src), Some(src.as_str()));
+                    if memoized
+                        .1
+                        .iter()
+                        .any(|d| d.message().contains("nested too deeply"))
+                    {
+                        deep += 1;
+                    }
+                }
+                // The range crosses the limit: some inputs are too deep.
+                assert!(deep > 0);
+            })
+            .unwrap();
+        handle.join().unwrap();
     }
 
     #[test]

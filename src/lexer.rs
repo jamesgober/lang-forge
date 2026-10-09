@@ -10,10 +10,11 @@
 
 use alloc::{boxed::Box, format, string::String, vec::Vec};
 
-use diag_lang::{Diagnostic, Label, Severity};
+use diag_lang::{Code, Diagnostic, Label, Severity};
 use syntax_lang::{Span, Token};
 
 use crate::{
+    codes,
     error::Report,
     kind::Kind,
     schematic::{IdentMode, LexerSpec},
@@ -128,7 +129,7 @@ pub(crate) fn is_ident(text: &str, mode: IdentMode) -> bool {
 /// Non-ASCII whitespace the lexer treats as whitespace: Unicode's
 /// Pattern_White_Space characters outside ASCII (UAX #31).
 #[inline]
-fn is_unicode_space(c: char) -> bool {
+pub(crate) fn is_unicode_space(c: char) -> bool {
     matches!(
         c,
         '\u{85}' | '\u{200E}' | '\u{200F}' | '\u{2028}' | '\u{2029}'
@@ -137,7 +138,7 @@ fn is_unicode_space(c: char) -> bool {
 
 /// The length of the UTF-8 sequence that starts with `lead`.
 #[inline]
-fn utf8_len(lead: u8) -> usize {
+pub(crate) fn utf8_len(lead: u8) -> usize {
     match lead {
         0x00..=0x7F => 1,
         0xC0..=0xDF => 2,
@@ -216,32 +217,15 @@ impl Lexer {
                         Label::new(second, "used again here"),
                     )
                     .with_secondary(Label::new(first, "first used here"))
-                    .with_note("a symbol, comment delimiter, or string delimiter must each have its own text"),
+                    .with_note("a symbol, comment delimiter, or string delimiter must each have its own text")
+                    .with_code(codes::TEXT_TWICE),
                 );
             }
         }
 
-        let mut class = [0u8; 256];
-        for b in [b' ', b'\t', 0x0B, 0x0C] {
-            class[b as usize] |= C_SPACE;
-        }
-        class[b'\r' as usize] |= C_CR;
-        class[b'\n' as usize] |= C_LF;
-        for b in (b'a'..=b'z')
-            .chain(b'A'..=b'Z')
-            .chain(core::iter::once(b'_'))
-        {
-            class[b as usize] |= C_IDENT;
-        }
-        for b in b'0'..=b'9' {
-            class[b as usize] |= C_DIGIT;
-        }
-        for b in 0x80..=0xFFu8 {
-            class[b as usize] |= C_HIGH;
-        }
+        let class = byte_classes(patterns.iter().map(|p| p.0[0]));
         let mut heads = Box::new([0u32; 257]);
         for (text, _, _) in &patterns {
-            class[text[0] as usize] |= C_FIXED;
             heads[text[0] as usize + 1] += 1;
         }
         for b in 0..256 {
@@ -451,11 +435,13 @@ impl Lexer {
             if let Some(bad) = digits.chars().find(|c| *c != '_' && !c.is_digit(radix)) {
                 let at = digits_start + digits.find(bad).unwrap_or(0);
                 diags.push(error(
+                    codes::LEX_BAD_DIGIT,
                     Span::new(at as u32, (at + bad.len_utf8()) as u32),
                     format!("invalid digit `{bad}` in {name} literal"),
                 ));
             } else if !digits.bytes().any(|b| b != b'_') {
                 diags.push(error(
+                    codes::LEX_NO_DIGITS,
                     Span::new(start as u32, end as u32),
                     format!("{name} literal has no digits"),
                 ));
@@ -493,6 +479,7 @@ impl Lexer {
         let end = self.ident_end(src, pos);
         if end > pos {
             diags.push(error(
+                codes::LEX_NUMBER_SUFFIX,
                 Span::new(pos as u32, end as u32),
                 format!("invalid suffix `{}` on number literal", &src[pos..end]),
             ));
@@ -514,6 +501,7 @@ impl Lexer {
         let open_text = &self.block_opens[close];
         let unterminated = |diags: &mut Vec<Diagnostic>| {
             diags.push(error(
+                codes::LEX_UNTERMINATED_COMMENT,
                 Span::new(start as u32, (start + open_text.len()) as u32),
                 "unterminated block comment",
             ));
@@ -561,6 +549,7 @@ impl Lexer {
         loop {
             let Some(&b) = bytes.get(i) else {
                 diags.push(error(
+                    codes::LEX_UNTERMINATED_STRING,
                     Span::new(start as u32, pos as u32),
                     "unterminated string",
                 ));
@@ -578,6 +567,7 @@ impl Lexer {
             }
             if b == b'\n' && !rule.multiline {
                 diags.push(error(
+                    codes::LEX_UNTERMINATED_STRING,
                     Span::new(start as u32, pos as u32),
                     "unterminated string",
                 ));
@@ -614,6 +604,7 @@ impl Lexer {
             "character"
         };
         diags.push(error(
+            codes::LEX_UNEXPECTED,
             Span::new(start as u32, end as u32),
             format!("unexpected {plural} {shown}"),
         ));
@@ -644,15 +635,41 @@ impl Lexer {
     }
 }
 
+/// The byte-class table for fixed texts beginning with the bytes `leads`.
+fn byte_classes(leads: impl Iterator<Item = u8>) -> [u8; 256] {
+    let mut class = [0u8; 256];
+    for b in [b' ', b'\t', 0x0B, 0x0C] {
+        class[b as usize] |= C_SPACE;
+    }
+    class[b'\r' as usize] |= C_CR;
+    class[b'\n' as usize] |= C_LF;
+    for b in (b'a'..=b'z')
+        .chain(b'A'..=b'Z')
+        .chain(core::iter::once(b'_'))
+    {
+        class[b as usize] |= C_IDENT;
+    }
+    for b in b'0'..=b'9' {
+        class[b as usize] |= C_DIGIT;
+    }
+    for b in 0x80..=0xFFu8 {
+        class[b as usize] |= C_HIGH;
+    }
+    for lead in leads {
+        class[lead as usize] |= C_FIXED;
+    }
+    class
+}
+
 /// The character starting at byte `pos`, which must be a char boundary.
 #[inline]
-fn char_at(src: &str, pos: usize) -> char {
+pub(crate) fn char_at(src: &str, pos: usize) -> char {
     src[pos..].chars().next().unwrap_or('\0')
 }
 
 /// The end of a line comment's text: before the line break (and before the
 /// `\r` of a `\r\n`).
-fn line_end(bytes: &[u8], pos: usize) -> usize {
+pub(crate) fn line_end(bytes: &[u8], pos: usize) -> usize {
     match bytes[pos..].iter().position(|b| *b == b'\n') {
         Some(at) => {
             let lf = pos + at;
@@ -666,8 +683,8 @@ fn line_end(bytes: &[u8], pos: usize) -> usize {
     }
 }
 
-fn error(span: Span, message: impl Into<Box<str>>) -> Diagnostic {
-    Diagnostic::new(Severity::Error, message, Label::unlabelled(span))
+fn error(code: Code, span: Span, message: impl Into<Box<str>>) -> Diagnostic {
+    Diagnostic::new(Severity::Error, message, Label::unlabelled(span)).with_code(code)
 }
 
 /// Rejects comment and string delimiters the scanner could never reach.
@@ -677,16 +694,19 @@ fn check_delimiter(text: &str, span: Span, what: &str, mode: IdentMode, report: 
     };
     if first.is_whitespace() || text.contains(char::is_whitespace) {
         report.error(
+            codes::DELIMITER,
             span,
             format!("{what} delimiter `{text}` contains whitespace"),
         );
     } else if first.is_ascii_digit() {
         report.error(
+            codes::DELIMITER,
             span,
             format!("{what} delimiter `{text}` starts with a digit, which begins a number"),
         );
     } else if is_ident_start(first, mode) {
         report.error(
+            codes::DELIMITER,
             span,
             format!(
                 "{what} delimiter `{text}` starts like an identifier, which the lexer reads first"
@@ -697,7 +717,7 @@ fn check_delimiter(text: &str, span: Span, what: &str, mode: IdentMode, report: 
 
 /// Keyword lookup: an open-addressing hash table over the keyword texts.
 #[derive(Clone, Debug, Default)]
-struct Keywords {
+pub(crate) struct Keywords {
     /// `0` for an empty slot, otherwise an index into `entries` plus one.
     slots: Box<[u32]>,
     entries: Box<[(Box<str>, Kind)]>,
@@ -706,7 +726,7 @@ struct Keywords {
 }
 
 impl Keywords {
-    fn new(entries: Vec<(Box<str>, Kind)>) -> Self {
+    pub(crate) fn new(entries: Vec<(Box<str>, Kind)>) -> Self {
         if entries.is_empty() {
             return Self::default();
         }
@@ -729,7 +749,7 @@ impl Keywords {
     }
 
     #[inline]
-    fn get(&self, text: &str) -> Option<Kind> {
+    pub(crate) fn get(&self, text: &str) -> Option<Kind> {
         if text.len() < self.min_len || text.len() > self.max_len || self.slots.is_empty() {
             return None;
         }
@@ -819,7 +839,7 @@ mod tests {
                     "tokens must be contiguous"
                 );
                 covered = t.span().end().to_usize();
-                let i = t.kind().index();
+                let i = t.kind().slot();
                 let name = BUILTIN_TOKENS
                     .get(i)
                     .map_or_else(|| format!("#{i}"), |n| n.to_string());
@@ -1103,5 +1123,145 @@ mod tests {
         assert!(!is_ident("1x", IdentMode::Xid));
         assert!(!is_ident("", IdentMode::Xid));
         assert!(!is_ident("a-b", IdentMode::Xid));
+    }
+}
+
+// ----- the language image -----
+
+crate::image::image_struct!(Pattern { text, action });
+crate::image::image_struct!(StringRule {
+    close,
+    escape,
+    multiline
+});
+crate::image::image_struct!(Keywords {
+    slots,
+    entries,
+    min_len,
+    max_len
+});
+crate::image::image_struct!(Lexer {
+    mode,
+    newlines,
+    nested,
+    class,
+    patterns,
+    heads,
+    block_closes,
+    block_opens,
+    strings,
+    keywords,
+    k_unknown,
+    k_whitespace,
+    k_comment,
+    k_newline,
+    k_ident,
+    k_number,
+    k_string,
+});
+
+impl crate::image::Image for Action {
+    fn put(&self, w: &mut crate::image::Writer) {
+        match *self {
+            Action::Symbol(k) => {
+                0u8.put(w);
+                k.put(w);
+            }
+            Action::LineComment => 1u8.put(w),
+            Action::BlockComment { close } => {
+                2u8.put(w);
+                close.put(w);
+            }
+            Action::Str { rule } => {
+                3u8.put(w);
+                rule.put(w);
+            }
+        }
+    }
+    fn get(r: &mut crate::image::Reader<'_>) -> crate::image::Res<Self> {
+        Ok(match u8::get(r)? {
+            0 => Action::Symbol(Kind::get(r)?),
+            1 => Action::LineComment,
+            2 => Action::BlockComment {
+                close: u32::get(r)?,
+            },
+            3 => Action::Str { rule: u32::get(r)? },
+            _ => return Err(crate::image::ImageError::Invalid),
+        })
+    }
+}
+
+impl Keywords {
+    /// Whether the table can be searched without panicking, and every kind
+    /// it yields satisfies `kind_ok`.
+    pub(crate) fn valid(&self, kind_ok: &dyn Fn(Kind) -> bool) -> bool {
+        let n = self.entries.len();
+        (self.slots.is_empty() || self.slots.len().is_power_of_two())
+            && self.slots.iter().all(|&s| s as usize <= n)
+            // An open-addressing probe ends at an empty slot.
+            && (self.slots.is_empty() || self.slots.contains(&0))
+            && self.entries.iter().all(|(_, k)| kind_ok(*k))
+    }
+}
+
+impl Lexer {
+    /// Whether every index the scanner follows is in range and every kind
+    /// it produces satisfies `kind_ok` (a token kind of the language).
+    pub(crate) fn valid(&self, kind_ok: &dyn Fn(Kind) -> bool) -> bool {
+        let heads_ok = self.heads.windows(2).all(|w| w[0] <= w[1])
+            && self.heads[0] == 0
+            && self.heads[256] as usize == self.patterns.len();
+        let patterns_ok = self.patterns.iter().all(|p| {
+            !p.text.is_empty()
+                && match p.action {
+                    Action::Symbol(k) => kind_ok(k),
+                    Action::LineComment => true,
+                    Action::BlockComment { close } => {
+                        (close as usize) < self.block_closes.len()
+                            && (close as usize) < self.block_opens.len()
+                    }
+                    Action::Str { rule } => (rule as usize) < self.strings.len(),
+                }
+        });
+        // Patterns sit under the head of their first byte.
+        // (Checked only once the heads are known to be in range.)
+        let grouped = heads_ok
+            && (0..256).all(|b| {
+                self.patterns
+                    .get(self.heads[b] as usize..self.heads[b + 1] as usize)
+                    .is_some_and(|group| {
+                        group
+                            .iter()
+                            .all(|p| p.text.first().is_some_and(|&t| t as usize == b))
+                    })
+            });
+        // Texts are whole UTF-8 sequences, so every token ends on a character
+        // boundary; escapes are ASCII; the byte classes are the ones `build`
+        // derives (the scanner trusts them to find identifier and number
+        // starts).
+        let text_ok = |t: &[u8]| !t.is_empty() && core::str::from_utf8(t).is_ok();
+        heads_ok
+            && patterns_ok
+            && grouped
+            && self.patterns.iter().all(|p| text_ok(&p.text))
+            && self
+                .strings
+                .iter()
+                .all(|s| text_ok(&s.close) && s.escape.is_none_or(|e| e.is_ascii()))
+            && self.block_closes.iter().all(|c| text_ok(c))
+            && self.block_opens.iter().all(|c| text_ok(c))
+            && self.class == byte_classes(self.patterns.iter().map(|p| p.text[0]))
+            && self.keywords.valid(kind_ok)
+            && [
+                self.k_unknown,
+                self.k_whitespace,
+                self.k_comment,
+                self.k_newline,
+                self.k_ident,
+                self.k_number,
+                self.k_string,
+            ]
+            .into_iter()
+            .all(kind_ok)
     }
 }

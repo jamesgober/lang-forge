@@ -31,11 +31,12 @@
 //! problem is reported — an unknown key is far more often a typo than an
 //! intention, so it is an error rather than something to ignore.
 
-use alloc::{borrow::Cow, collections::BTreeSet, format, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, collections::BTreeSet, format, vec::Vec};
 
 use syntax_lang::Span;
 
 use crate::{
+    codes,
     error::Report,
     noml::{Entry, Table, Text, Value, ValueKind},
 };
@@ -43,6 +44,10 @@ use crate::{
 /// A schematic, checked for layout but not yet for grammar.
 #[derive(Debug)]
 pub(crate) struct Schematic<'s> {
+    /// The sketch format: 1 (lang-forge 1.x's schematic) or 2 (LSF2).
+    pub(crate) format: u8,
+    /// What format 2 adds; `None` for a format-1 schematic.
+    pub(crate) v2: Option<Box<crate::spec2::V2<'s>>>,
     pub(crate) name: Cow<'s, str>,
     pub(crate) version: Option<Cow<'s, str>>,
     pub(crate) extensions: Vec<Cow<'s, str>>,
@@ -96,6 +101,17 @@ pub(crate) struct RuleSpec<'s> {
     pub(crate) name: Cow<'s, str>,
     pub(crate) name_span: Span,
     pub(crate) body: Body<'s>,
+    /// Format-2 rule options (all defaults in format 1).
+    pub(crate) options: RuleOptions<'s>,
+}
+
+/// The options of a format-2 `[rules.<name>]` table with `rule`.
+#[derive(Debug, Default)]
+pub(crate) struct RuleOptions<'s> {
+    /// `allow = ["overlap"]`: an intended `LSF4301` divergence.
+    pub(crate) allow_overlap: bool,
+    /// Extra recovery synchronization tokens (token references).
+    pub(crate) sync: Vec<(Cow<'s, str>, Span)>,
 }
 
 /// A rule's definition.
@@ -125,7 +141,7 @@ pub(crate) enum Fixity {
 }
 
 impl Fixity {
-    const KEYS: [(&'static str, Fixity); 5] = [
+    pub(crate) const KEYS: [(&'static str, Fixity); 5] = [
         ("left", Fixity::Left),
         ("right", Fixity::Right),
         ("none", Fixity::NonAssoc),
@@ -138,15 +154,34 @@ impl Fixity {
 #[derive(Debug)]
 pub(crate) struct LevelSpec<'s> {
     pub(crate) fixity: Fixity,
+    /// Format 2: the level's `prec` (checked, carried for `dynamic`).
+    pub(crate) prec: Option<(i64, Span)>,
     pub(crate) operators: Vec<(Cow<'s, str>, Span)>,
     pub(crate) then: Option<(Text<'s>, Span)>,
     pub(crate) node: Option<(Cow<'s, str>, Span)>,
     pub(crate) span: Span,
 }
 
-/// Interprets a read document. Problems go to `report`; the result is `None`
-/// when a required part is missing.
-pub(crate) fn interpret<'s>(root: Table<'s>, report: &mut Report) -> Option<Schematic<'s>> {
+/// Interprets a read document of either format (LSF2 §2.1): no `[sketch]`
+/// table, or `[sketch]` with only `format = 1`, is format 1, read exactly as
+/// lang-forge 1.x read it; `format = 2` is format 2. Problems go to `report`;
+/// the result is `None` when a required part is missing.
+pub(crate) fn interpret<'s>(mut root: Table<'s>, report: &mut Report) -> Option<Schematic<'s>> {
+    let Some(at) = root.entries.iter().position(|e| e.key == "sketch") else {
+        return interpret_v1(root, report);
+    };
+    match crate::spec2::format_of(&root.entries[at], report)? {
+        1 => {
+            // `[sketch] format = 1` adds nothing: read the rest as format 1.
+            let _ = root.entries.remove(at);
+            interpret_v1(root, report)
+        }
+        _ => crate::spec2::interpret(root, report),
+    }
+}
+
+/// Interprets a format-1 document: lang-forge 1.x's schematic, unchanged.
+fn interpret_v1<'s>(root: Table<'s>, report: &mut Report) -> Option<Schematic<'s>> {
     let mut language = None;
     let mut lexer = None;
     let mut rules = None;
@@ -164,6 +199,7 @@ pub(crate) fn interpret<'s>(root: Table<'s>, report: &mut Report) -> Option<Sche
                 }
             }
             other => report.error_help(
+                codes::UNKNOWN_SECTION,
                 key_span,
                 format!("unknown section `{other}`"),
                 "a schematic has [language], [lexer], [rules], and [capabilities]",
@@ -176,7 +212,7 @@ pub(crate) fn interpret<'s>(root: Table<'s>, report: &mut Report) -> Option<Sche
         Some(Some(t)) => read_language(t, report),
         Some(None) => None,
         None => {
-            report.error(Span::empty(0), "missing [language] table");
+            report.error(codes::MISSING, Span::empty(0), "missing [language] table");
             None
         }
     };
@@ -184,13 +220,15 @@ pub(crate) fn interpret<'s>(root: Table<'s>, report: &mut Report) -> Option<Sche
         Some(Some((t, span))) => Some(read_rules(t, span, report)),
         Some(None) => None,
         None => {
-            report.error(Span::empty(0), "missing [rules] table");
+            report.error(codes::MISSING, Span::empty(0), "missing [rules] table");
             None
         }
     };
     let (name, version, extensions, start) = identity?;
     let rules = rules?;
     Some(Schematic {
+        format: 1,
+        v2: None,
         name,
         version,
         extensions,
@@ -221,7 +259,7 @@ fn read_language<'s>(t: Table<'s>, report: &mut Report) -> Option<Identity<'s>> 
                 name_given = true;
                 if let Some((text, span)) = string(entry, report) {
                     if text.trim().is_empty() {
-                        report.error(span, "the language name is empty");
+                        report.error(codes::LANGUAGE_NAME, span, "the language name is empty");
                     } else {
                         name = Some(text);
                     }
@@ -231,9 +269,10 @@ fn read_language<'s>(t: Table<'s>, report: &mut Report) -> Option<Identity<'s>> 
             "extensions" => {
                 for (ext, span) in strings(entry, report) {
                     if ext.is_empty() {
-                        report.error(span, "an extension is empty");
+                        report.error(codes::EXTENSION, span, "an extension is empty");
                     } else if let Some(bare) = ext.strip_prefix('.') {
                         report.error_help(
+                            codes::EXTENSION,
                             span,
                             format!("extension `{ext}` starts with a dot"),
                             format!("write `{bare}`"),
@@ -254,7 +293,7 @@ fn read_language<'s>(t: Table<'s>, report: &mut Report) -> Option<Identity<'s>> 
         }
     }
     if !name_given {
-        report.error(header, "missing `name` in [language]");
+        report.error(codes::MISSING, header, "missing `name` in [language]");
     }
     Some((name?, version, extensions, start))
 }
@@ -282,6 +321,7 @@ fn read_lexer<'s>(t: Table<'s>, report: &mut Report) -> LexerSpec<'s> {
                         "xid" => spec.identifiers = IdentMode::Xid,
                         "ascii" => spec.identifiers = IdentMode::Ascii,
                         other => report.error_help(
+                            codes::IDENT_STYLE,
                             span,
                             format!("unknown identifier style `{other}`"),
                             "use \"xid\" (Unicode identifiers) or \"ascii\"",
@@ -294,7 +334,7 @@ fn read_lexer<'s>(t: Table<'s>, report: &mut Report) -> LexerSpec<'s> {
             "line_comments" => {
                 for (open, span) in strings(entry, report) {
                     if open.is_empty() {
-                        report.error(span, "a comment delimiter is empty");
+                        report.error(codes::DELIMITER, span, "a comment delimiter is empty");
                     } else {
                         spec.line_comments.push((open, span));
                     }
@@ -339,10 +379,11 @@ fn read_lexer<'s>(t: Table<'s>, report: &mut Report) -> LexerSpec<'s> {
     spec
 }
 
-fn block_comment<'s>(item: Value<'s>, report: &mut Report) -> Option<BlockSpec<'s>> {
+pub(crate) fn block_comment<'s>(item: Value<'s>, report: &mut Report) -> Option<BlockSpec<'s>> {
     let span = item.span;
     let shape_error = |report: &mut Report| {
         report.error_help(
+            codes::WRONG_TYPE,
             span,
             "a block comment is a pair of delimiters",
             "write it as [\"/*\", \"*/\"]",
@@ -363,6 +404,7 @@ fn block_comment<'s>(item: Value<'s>, report: &mut Report) -> Option<BlockSpec<'
         match v.kind {
             ValueKind::Str(t) => texts.push(t.text),
             other => report.error_help(
+                codes::WRONG_TYPE,
                 v.span,
                 format!(
                     "a block comment delimiter must be a string, found {}",
@@ -377,18 +419,18 @@ fn block_comment<'s>(item: Value<'s>, report: &mut Report) -> Option<BlockSpec<'
         return None;
     };
     if open.is_empty() || close.is_empty() {
-        report.error(span, "a comment delimiter is empty");
+        report.error(codes::DELIMITER, span, "a comment delimiter is empty");
         return None;
     }
     Some(BlockSpec { open, close, span })
 }
 
-fn string_spec<'s>(item: Value<'s>, report: &mut Report) -> Option<StringSpec<'s>> {
+pub(crate) fn string_spec<'s>(item: Value<'s>, report: &mut Report) -> Option<StringSpec<'s>> {
     let span = item.span;
     match item.kind {
         ValueKind::Str(open) => {
             if open.text.is_empty() {
-                report.error(span, "a string delimiter is empty");
+                report.error(codes::STRING_CLOSE, span, "a string delimiter is empty");
                 return None;
             }
             Some(StringSpec {
@@ -418,6 +460,7 @@ fn string_spec<'s>(item: Value<'s>, report: &mut Report) -> Option<StringSpec<'s
                                 }
                                 _ => {
                                     report.error_help(
+                                        codes::ESCAPE,
                                         at,
                                         format!("escape `{text}` is not a single character"),
                                         "use one ASCII character such as \"\\\\\", or \"\" for none",
@@ -438,12 +481,16 @@ fn string_spec<'s>(item: Value<'s>, report: &mut Report) -> Option<StringSpec<'s
                 }
             }
             let Some((open, open_span)) = open else {
-                report.error(span, "a string needs an `open` delimiter");
+                report.error(codes::MISSING, span, "a string needs an `open` delimiter");
                 return None;
             };
             let close = close.map_or_else(|| open.clone(), |(c, _)| c);
             if open.is_empty() || close.is_empty() {
-                report.error(open_span, "a string delimiter is empty");
+                report.error(
+                    codes::STRING_CLOSE,
+                    open_span,
+                    "a string delimiter is empty",
+                );
                 return None;
             }
             Some(StringSpec {
@@ -456,6 +503,7 @@ fn string_spec<'s>(item: Value<'s>, report: &mut Report) -> Option<StringSpec<'s
         }
         _ => {
             report.error_help(
+                codes::WRONG_TYPE,
                 span,
                 format!(
                     "expected a string delimiter, found {}",
@@ -468,7 +516,7 @@ fn string_spec<'s>(item: Value<'s>, report: &mut Report) -> Option<StringSpec<'s
     }
 }
 
-fn item_type(kind: &ValueKind<'_>) -> &'static str {
+pub(crate) fn item_type(kind: &ValueKind<'_>) -> &'static str {
     kind.type_name()
 }
 
@@ -486,6 +534,7 @@ fn read_rules<'s>(t: Table<'s>, span: Span, report: &mut Report) -> Vec<RuleSpec
             },
             other => {
                 report.error(
+                    codes::WRONG_TYPE,
                     value_span,
                     format!(
                         "rule `{}` must be a string or a table, found {}",
@@ -500,10 +549,11 @@ fn read_rules<'s>(t: Table<'s>, span: Span, report: &mut Report) -> Vec<RuleSpec
             name: entry.key,
             name_span,
             body,
+            options: RuleOptions::default(),
         });
     }
     if rules.is_empty() && declared == 0 {
-        report.error(span, "[rules] declares no rules");
+        report.error(codes::MISSING, span, "[rules] declares no rules");
     }
     rules
 }
@@ -535,7 +585,11 @@ fn read_pratt<'s>(t: Table<'s>, span: Span, report: &mut Report) -> Option<Pratt
         }
     }
     let Some(operand) = operand else {
-        report.error(span, "an expression rule needs an `operand`");
+        report.error(
+            codes::MISSING,
+            span,
+            "an expression rule needs an `operand`",
+        );
         return None;
     };
     Some(PrattSpec {
@@ -548,6 +602,7 @@ fn read_level<'s>(item: Value<'s>, report: &mut Report) -> Option<LevelSpec<'s>>
     let span = item.span;
     let ValueKind::Table(t) = item.kind else {
         report.error_help(
+            codes::WRONG_TYPE,
             span,
             format!(
                 "an operator level must be a table, found {}",
@@ -564,7 +619,7 @@ fn read_level<'s>(item: Value<'s>, report: &mut Report) -> Option<LevelSpec<'s>>
     for entry in t.entries {
         if let Some(&(_, f)) = Fixity::KEYS.iter().find(|(k, _)| *k == entry.key) {
             if fixity.is_some() {
-                report.error(entry.key_span, "an operator level has exactly one of `left`, `right`, `none`, `prefix`, or `postfix`");
+                report.error(codes::WRONG_TYPE, entry.key_span, "an operator level has exactly one of `left`, `right`, `none`, `prefix`, or `postfix`");
                 continue;
             }
             fixity = Some(f);
@@ -585,6 +640,7 @@ fn read_level<'s>(item: Value<'s>, report: &mut Report) -> Option<LevelSpec<'s>>
     }
     let Some(fixity) = fixity else {
         report.error_help(
+            codes::MISSING,
             span,
             "an operator level names no operators",
             "add one of `left`, `right`, `none`, `prefix`, or `postfix`",
@@ -592,11 +648,12 @@ fn read_level<'s>(item: Value<'s>, report: &mut Report) -> Option<LevelSpec<'s>>
         return None;
     };
     if operators.is_empty() {
-        report.error(span, "an operator level names no operators");
+        report.error(codes::MISSING, span, "an operator level names no operators");
         return None;
     }
     Some(LevelSpec {
         fixity,
+        prec: None,
         operators,
         then,
         node,
@@ -622,14 +679,19 @@ fn read_capabilities<'s>(t: Table<'s>, report: &mut Report) -> Vec<(Cow<'s, str>
             "include" => {
                 for (name, span) in strings(entry, report) {
                     if name.trim().is_empty() {
-                        report.error(span, "a capability name is empty");
+                        report.error(codes::CAPABILITY_NAME, span, "a capability name is empty");
                     } else if name.trim() != name {
                         report.error(
+                            codes::CAPABILITY_NAME,
                             span,
                             format!("capability name `{name}` has surrounding whitespace"),
                         );
                     } else if !seen.insert(name.clone()) {
-                        report.error(span, format!("capability `{name}` is included twice"));
+                        report.error(
+                            codes::CAPABILITY_NAME,
+                            span,
+                            format!("capability `{name}` is included twice"),
+                        );
                     } else {
                         include.push((name, span));
                     }
@@ -647,21 +709,23 @@ fn read_capabilities<'s>(t: Table<'s>, report: &mut Report) -> Vec<(Cow<'s, str>
     include
 }
 
-fn unknown_key(report: &mut Report, span: Span, key: &str, place: &str, known: &[&str]) {
+pub(crate) fn unknown_key(report: &mut Report, span: Span, key: &str, place: &str, known: &[&str]) {
     let list = known
         .iter()
         .map(|k| format!("`{k}`"))
         .collect::<Vec<_>>()
         .join(", ");
     report.error_help(
+        codes::UNKNOWN_KEY,
         span,
         format!("unknown key `{key}` in {place}"),
         format!("expected one of {list}"),
     );
 }
 
-fn expected(report: &mut Report, entry: &Entry<'_>, what: &str) {
+pub(crate) fn expected(report: &mut Report, entry: &Entry<'_>, what: &str) {
     report.error(
+        codes::WRONG_TYPE,
         entry.value.span,
         format!(
             "`{}` must be {what}, found {}",
@@ -671,7 +735,7 @@ fn expected(report: &mut Report, entry: &Entry<'_>, what: &str) {
     );
 }
 
-fn table<'s>(entry: Entry<'s>, report: &mut Report) -> Option<Table<'s>> {
+pub(crate) fn table<'s>(entry: Entry<'s>, report: &mut Report) -> Option<Table<'s>> {
     if let ValueKind::Table(t) = entry.value.kind {
         return Some(t);
     }
@@ -679,7 +743,7 @@ fn table<'s>(entry: Entry<'s>, report: &mut Report) -> Option<Table<'s>> {
     None
 }
 
-fn array<'s>(entry: Entry<'s>, report: &mut Report) -> Option<Vec<Value<'s>>> {
+pub(crate) fn array<'s>(entry: Entry<'s>, report: &mut Report) -> Option<Vec<Value<'s>>> {
     if let ValueKind::Array(items) = entry.value.kind {
         return Some(items);
     }
@@ -687,7 +751,7 @@ fn array<'s>(entry: Entry<'s>, report: &mut Report) -> Option<Vec<Value<'s>>> {
     None
 }
 
-fn boolean(entry: Entry<'_>, report: &mut Report) -> Option<bool> {
+pub(crate) fn boolean(entry: Entry<'_>, report: &mut Report) -> Option<bool> {
     if let ValueKind::Bool(b) = entry.value.kind {
         return Some(b);
     }
@@ -695,7 +759,7 @@ fn boolean(entry: Entry<'_>, report: &mut Report) -> Option<bool> {
     None
 }
 
-fn text<'s>(entry: Entry<'s>, report: &mut Report) -> Option<(Text<'s>, Span)> {
+pub(crate) fn text<'s>(entry: Entry<'s>, report: &mut Report) -> Option<(Text<'s>, Span)> {
     let span = entry.value.span;
     if let ValueKind::Str(t) = entry.value.kind {
         return Some((t, span));
@@ -704,12 +768,12 @@ fn text<'s>(entry: Entry<'s>, report: &mut Report) -> Option<(Text<'s>, Span)> {
     None
 }
 
-fn string<'s>(entry: Entry<'s>, report: &mut Report) -> Option<(Cow<'s, str>, Span)> {
+pub(crate) fn string<'s>(entry: Entry<'s>, report: &mut Report) -> Option<(Cow<'s, str>, Span)> {
     text(entry, report).map(|(t, span)| (t.text, span))
 }
 
 /// An array of strings; non-string items are reported and skipped.
-fn strings<'s>(entry: Entry<'s>, report: &mut Report) -> Vec<(Cow<'s, str>, Span)> {
+pub(crate) fn strings<'s>(entry: Entry<'s>, report: &mut Report) -> Vec<(Cow<'s, str>, Span)> {
     let key = entry.key.clone();
     let Some(items) = array(entry, report) else {
         return Vec::new();
@@ -720,6 +784,7 @@ fn strings<'s>(entry: Entry<'s>, report: &mut Report) -> Vec<(Cow<'s, str>, Span
         match item.kind {
             ValueKind::Str(t) => out.push((t.text, span)),
             other => report.error(
+                codes::WRONG_TYPE,
                 span,
                 format!("`{key}` must hold strings, found {}", item_type(&other)),
             ),

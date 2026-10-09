@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<head><title><?= htmlspecialchars($title) ?></title></head>
+<body>
+<?mox if ($user): ?>
+  <p>Welcome back, <?= $user->name ?>!</p>
+  <?mox foreach ($items as $i => $item): ?>
+    <li class="<?= $i % 2 ? 'odd' : 'even' ?>"><?= $item ?></li>
+  <?mox endforeach; ?>
+<?mox else: ?>
+  <a href="/login">Log in</a>
+<?mox endif; ?>
+<?mox
+// a comment that stops before the close tag ?>
+<footer>&copy; <?= date('Y') ?></footer>
+</body>
+</html>

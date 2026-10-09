@@ -1,4 +1,5 @@
-//! Criterion benchmarks: forging, lexing, and parsing.
+//! Criterion benchmarks: forging, lexing, and parsing (format 1), and the
+//! format-2 Mox front end.
 //!
 //! Inputs are generated, so every run measures the same text: realistic mini
 //! code and JSON of about 1 MB, a long operator chain, and token soup that
@@ -12,6 +13,9 @@ use lang_forge::Language;
 const MINI: &str = include_str!("../examples/schematics/mini.lsf");
 const JSON: &str = include_str!("../examples/schematics/json.lsf");
 const CALC: &str = include_str!("../examples/schematics/calc.lsf");
+const MOX: &str = include_str!("../tests/sketches/mox.lsf");
+const MOX_SCRIPT: &str = include_str!("../tests/mox/script.mox");
+const MOX_TEMPLATE: &str = include_str!("../tests/mox/template.mox");
 const SPECULATIVE: &str = r#"
 [language]
 name = "spec"
@@ -170,5 +174,58 @@ fn bench_parse(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_forge, bench_lex, bench_parse);
+/// About `bytes` of Mox script: the representative script's code repeated
+/// inside one `<?mox` island.
+fn mox_script(bytes: usize) -> String {
+    let body = MOX_SCRIPT
+        .strip_prefix("<?mox\n")
+        .expect("the script opens an island");
+    let mut out = String::from("<?mox\n");
+    while out.len() < bytes {
+        out.push_str(body);
+    }
+    out
+}
+
+/// About `bytes` of Mox template: text with `<?mox` and `<?=` islands.
+fn mox_template(bytes: usize) -> String {
+    let mut out = String::new();
+    while out.len() < bytes {
+        out.push_str(MOX_TEMPLATE);
+    }
+    out
+}
+
+/// Format 2 (new in 2.0): forging the Mox sketch (modes, string classes,
+/// labels, the overlap check), loading its image, and lexing and parsing Mox
+/// scripts and templates. Kept out of the 1.x groups, whose names and inputs
+/// are unchanged so they compare against the 1.x baseline.
+fn bench_v2(c: &mut Criterion) {
+    let mut group = c.benchmark_group("v2");
+    group.sample_size(30);
+    group.bench_function("forge/mox", |b| {
+        b.iter(|| Language::from_lsf(black_box(MOX)))
+    });
+    let mox = Language::from_lsf(MOX).expect("forges");
+    let image = mox.to_image();
+    group.bench_function("image/mox/to", |b| b.iter(|| black_box(&mox).to_image()));
+    group.bench_function("image/mox/from", |b| {
+        b.iter(|| Language::from_image(black_box(&image)))
+    });
+    for (name, src) in [
+        ("mox_script/1MB", mox_script(1 << 20)),
+        ("mox_template/256KB", mox_template(256 << 10)),
+    ] {
+        group.throughput(Throughput::Bytes(src.len() as u64));
+        group.bench_with_input(BenchmarkId::new("lex", name), &src, |b, src| {
+            b.iter(|| mox.lex(black_box(src)));
+        });
+        group.bench_with_input(BenchmarkId::new("parse", name), &src, |b, src| {
+            b.iter(|| mox.parse(black_box(src)));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_forge, bench_lex, bench_parse, bench_v2);
 criterion_main!(benches);

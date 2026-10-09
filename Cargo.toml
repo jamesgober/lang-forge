@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "lang-forge"
-version = "1.0.1"
+version = "2.0.0-alpha.1"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -59,12 +59,16 @@ std = ["syntax-lang/std", "diag-lang/std", "pass-lang/std"]
 syntax-lang = { version = "1", default-features = false }
 # Diagnostics. Schematic errors and parse errors are `diag_lang::Diagnostic`s
 # with labelled spans, rendered with source context by `diag_lang::Renderer`.
-diag-lang = { version = "1", default-features = false }
+# 1.1 for diagnostic codes (`LSF` sketch codes, `LF` program codes) and the
+# re-exported `SourceMap` multi-file sketches report into.
+diag-lang = { version = "1.1", default-features = false }
 # The pass manager. A schematic names its capabilities; `Language::pipeline`
 # assembles the matching passes, in schematic order, into a `PassManager`.
 pass-lang = { version = "1", default-features = false }
-# UAX #31 identifier rules (XID_Start / XID_Continue) for Unicode identifiers.
-unicode-lang = { version = "1", default-features = false }
+# UAX #31 identifier rules (XID_Start / XID_Continue) for Unicode identifiers
+# and the `\p{XID_*}` regex classes; UAX #15 normalization (the `alloc`
+# feature) checks `normalize = "require-nfc"` identifiers.
+unicode-lang = { version = "1", default-features = false, features = ["alloc"] }
 
 
 # DEV DEPENDENCIES

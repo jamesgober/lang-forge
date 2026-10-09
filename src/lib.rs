@@ -84,6 +84,64 @@
 //! with an optional `then` (more grammar after the operator, for calls,
 //! indexing, or `?:`) and an optional `node` name.
 //!
+//! ## Format 2
+//!
+//! A sketch that says `[sketch] format = 2` uses LSF2's syntax: custom token
+//! classes (regular expressions), lexer modes with a mode stack, string
+//! classes with interpolation, heredocs, and raw delimiters, contextual and
+//! case-insensitive keywords, indentation layout, labelled fields on tree
+//! edges, predicates (`&e`, `!e`), text back-references, `EOF` /
+//! `LINE_START` / `NL_BEFORE`, injections, `[ast]` supertypes, and a check
+//! that rejects greedy repetitions that would silently reject valid input.
+//! A sketch with no `[sketch]` table, or `format = 1`, forges exactly as
+//! lang-forge 1.x did.
+//!
+//! ```
+//! use lang_forge::Language;
+//!
+//! let lang = Language::from_lsf(
+//!     r##"
+//!     [sketch]
+//!     format = 2
+//!
+//!     [language]
+//!     name = "tmpl"
+//!     version = "1.0.0"
+//!
+//!     [lexer]
+//!     initial_mode = "text"
+//!
+//!     [lexer.tokens]
+//!     OPEN  = { literal = "{{", modes = ["text"], action = "push main" }
+//!     CLOSE = { literal = "}}", action = "pop" }
+//!     VAR   = { regex = '\$[a-z]+' }
+//!
+//!     [lexer.modes.text]
+//!     tokens = ["OPEN"]
+//!     text = "TEXT"
+//!
+//!     [rules]
+//!     page = "(TEXT | hole)*"
+//!     hole = "OPEN value:VAR filters:('|' IDENT)* CLOSE"
+//!     "##,
+//! )?;
+//!
+//! let parse = lang.parse("Hello, {{ $name | upper }}!");
+//! assert!(!parse.has_errors());
+//! let hole = parse.tree().child_nodes().next().expect("a hole");
+//! let fields: Vec<&str> = (0..hole.len())
+//!     .filter_map(|i| lang.field_label(hole, i).and_then(|l| lang.label_name(l)))
+//!     .collect();
+//! assert_eq!(fields, ["value", "filters", "filters"]);
+//! # Ok::<(), lang_forge::Error>(())
+//! ```
+//!
+//! A forged language can be saved as an image ([`Language::to_image`]) and
+//! loaded without forging ([`Language::from_image`]); a sketch can span
+//! several files ([`Sketch`]); and every diagnostic carries a stable code
+//! (`LSF` for sketches, `LF0xxx` lexical and `LF1xxx` parse errors in
+//! source).
+//!
 //! ## Errors and recovery
 //!
 //! Forging reports every problem in a schematic at once, each with a span
@@ -104,11 +162,11 @@
 //!
 //! ## Stability
 //!
-//! The public surface is frozen as of `1.0.0` and follows Semantic Versioning:
-//! no breaking change before `2.0`, additions arrive in minor releases, and the
-//! MSRV (Rust 1.85) only rises in a minor. The promise covers the API, the
-//! `.lsf` schematic format, the trees forged languages build from valid input,
-//! and the parser's guarantees; it is set out in full in
+//! This is `2.0.0-alpha.1`, a pre-release of the next major version. The
+//! format-1 surface and behaviour of 1.x are kept (format-1 sketches forge
+//! and parse exactly as before); the breaking changes are listed in the
+//! CHANGELOG with a migration guide. The format-2 surface may still change
+//! before `2.0.0`. The 1.x promise and what 2.0 changes are set out in
 //! [`docs/API.md`](https://github.com/jamesgober/lang-forge/blob/main/docs/API.md#stability).
 
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -132,23 +190,39 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod codes;
 mod error;
+mod fields;
 mod grammar;
+mod grammar2;
+mod image;
+mod image_impls;
+mod inject;
 mod kind;
 mod language;
+mod layout;
 mod lexer;
 mod noml;
+mod overlap;
 mod parse;
 mod parser;
+mod regex;
 mod rule;
+mod scan;
 mod schematic;
 mod set;
+mod sketch;
+mod spec2;
+mod suggest;
 mod tree;
 
 pub use error::Error;
+pub use fields::{Cardinality, Field};
+pub use image::{IMAGE_FORMAT, ImageError};
 pub use kind::Kind;
 pub use language::{Capability, Language};
-pub use parse::Parse;
+pub use parse::{Injection, Parse};
+pub use sketch::Sketch;
 
 // Re-exported whole: trees are `syntax_lang` trees, problems are `diag_lang`
 // diagnostics, and capabilities are `pass_lang` passes.
