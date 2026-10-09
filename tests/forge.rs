@@ -307,6 +307,37 @@ fn test_forge_rejects_bad_lexer_settings() {
 }
 
 #[test]
+fn test_forge_rejects_non_string_block_comment_delimiters() {
+    // 1.0.0 dropped non-string items from a pair silently, so these forged
+    // as if the stray item were not there.
+    let lexer = |body: &str| {
+        format!("[language]\nname = \"t\"\n[lexer]\n{body}\n[rules]\na = \"NUMBER\"\n")
+    };
+    assert_eq!(
+        refuse(&lexer("block_comments = [[\"/*\", 1, \"*/\"]]")),
+        ["a block comment is a pair of delimiters"]
+    );
+    assert_eq!(
+        refuse(&lexer("block_comments = [[\"/*\", \"*/\", true]]")),
+        ["a block comment is a pair of delimiters"]
+    );
+    assert_eq!(
+        refuse(&lexer("block_comments = [[\"/*\", true]]")),
+        ["a block comment delimiter must be a string, found a boolean"]
+    );
+    assert_eq!(
+        refuse(&lexer("block_comments = [[[\"/*\"], [\"*/\"]]]")),
+        [
+            "a block comment delimiter must be a string, found an array",
+            "a block comment delimiter must be a string, found an array",
+        ]
+    );
+    let lang = Language::from_lsf(&lexer("block_comments = [[\"/*\", \"*/\"], ['{-', '-}']]"))
+        .expect("forges");
+    assert!(!lang.parse("/* a */ 1 {- b -}").has_errors());
+}
+
+#[test]
 fn test_forge_rejects_unreachable_delimiters() {
     let lexer = |body: &str| {
         format!("[language]\nname = \"t\"\n[lexer]\n{body}\n[rules]\na = \"NUMBER\"\n")
@@ -620,6 +651,60 @@ fn test_forge_passes_noml_syntax_errors_through() {
     assert_eq!(
         refuse_one("[language]\nname = \"t\nx\"\n"),
         "unterminated string"
+    );
+}
+
+#[test]
+fn test_forge_holds_schematics_to_the_noml_spec() {
+    // A table defined by dotted keys cannot be defined again by a header.
+    // 1.0.0 merged the two, so this forged.
+    assert_eq!(
+        refuse_one(
+            "[language]\nname = \"t\"\n[rules]\nexpr.operand = \"NUMBER\"\n[rules.expr]\nlevels = [{ left = [\"+\"] }]\n"
+        ),
+        "table [rules.expr] is already defined by dotted keys"
+    );
+    // Written either way on its own, it forges.
+    for schematic in [
+        "[language]\nname = \"t\"\n[rules]\nexpr.operand = \"NUMBER\"\nexpr.levels = [{ left = [\"+\"] }]\n",
+        "[language]\nname = \"t\"\n[rules.expr]\noperand = \"NUMBER\"\nlevels = [{ left = [\"+\"] }]\n",
+    ] {
+        let lang = Language::from_lsf(schematic).expect("forges");
+        assert!(!lang.parse("1 + 2").has_errors());
+    }
+    // Keys are never multi-line strings.
+    assert_eq!(
+        refuse_one("[language]\n\"\"\"name\"\"\" = \"t\"\n[rules]\na = \"NUMBER\"\n"),
+        "a key cannot be a multi-line string"
+    );
+    // Numbers, dates, and times must be well formed — though no setting
+    // takes one, so a well-formed one is still the wrong type.
+    assert_eq!(
+        refuse_one("[language]\nname = \"t\"\n[lexer]\nnewlines = 1abc\n[rules]\na = \"NUMBER\"\n"),
+        "invalid number `1abc`"
+    );
+    assert_eq!(
+        refuse_one("[language]\nname = \"t\"\n[lexer]\nnewlines = 0x1F\n[rules]\na = \"NUMBER\"\n"),
+        "`newlines` must be a boolean, found a number"
+    );
+    assert_eq!(
+        refuse_one("[language]\nname = \"t\"\nversion = 2026-10-08\n[rules]\na = \"NUMBER\"\n"),
+        "`version` must be a string, found a date or time"
+    );
+}
+
+#[test]
+fn test_forge_accepts_a_leading_byte_order_mark() {
+    let lang = Language::from_lsf("\u{FEFF}[language]\nname = \"t\"\n[rules]\na = \"NUMBER\"\n")
+        .expect("forges");
+    assert_eq!(lang.name(), "t");
+    // Spans still point into the text as given, mark included.
+    let schematic = "\u{FEFF}[language]\nname = \"t\"\nnope = 1\n[rules]\na = \"NUMBER\"\n";
+    let err = Language::from_lsf(schematic).expect_err("unknown key");
+    let span = err.diagnostics()[0].primary().span();
+    assert_eq!(
+        &schematic[span.start().to_usize()..span.end().to_usize()],
+        "nope"
     );
 }
 

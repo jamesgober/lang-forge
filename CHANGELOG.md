@@ -13,6 +13,82 @@
 
 ---
 
+## [1.0.1] - 2026-10-08
+
+A hardening patch from the LexerSketch audit. No public API changes; the
+`.lsf` format is unchanged. Some schematics 1.0.0 forged are now refused:
+each is invalid NOML or hostile, and each is listed below.
+
+### Fixed
+
+- After one construct was nested too deeply, every later speculative choice
+  in the file tried only its first alternative, so valid code after it got
+  spurious errors. The depth-limit flag is now cleared when an outermost
+  speculation begins and ends; inside a speculation it still limits each
+  decision to one attempt, which keeps that speculation linear.
+- The memo copied the events of every successful attempt at every level of
+  nesting, so its memory grew with the input times its nesting depth. It now
+  keeps events where the parser produced them and moves them only when a
+  rewind would discard them — once, keeping nested replays as references. A
+  60-deep nested speculation went from about 253 MiB to 24 MiB peak heap,
+  and from about 96 ms to 38 ms.
+- A UTF-8 byte-order mark at the start of a source was an `UNKNOWN`
+  character with an error. It is now trivia: it begins the first `WHITESPACE`
+  token, together with any whitespace after it, so the tree keeps it. A
+  leading byte-order mark in a schematic is skipped (spans still count it).
+- The schematic reader followed TOML less strictly than documented. Now
+  refused, as NOML and TOML require: a `[header]` defining a table already
+  defined by dotted keys (`expr.operand = "..."` then `[rules.expr]`, which
+  1.0.0 merged and forged); a multi-line string as a key (1.0.0 accepted
+  it); and a malformed number, date, or time (`1abc`, `-`, `0123`,
+  `1979-13-01`). Well-formed numbers, dates, and times, including `inf`,
+  `nan`, and RFC 3339 date-times, are read and reported as the wrong type,
+  since no setting takes one.
+- A block-comment pair with a non-string item (`["/*", 1, "*/"]`) had the
+  item dropped silently and forged. A pair is now exactly two strings.
+- Documentation: the schematic layout example in `src/schematic.rs` used a
+  string delimiter (`r"`) the lexer rejects (it is now a forgeable schematic,
+  checked by a test); `Language::kind_name` claimed to return `"<unknown>"`
+  for another language's kind, when it can return a wrong name; the crate
+  docs and README said forged trees "plug straight into" the formatter,
+  incremental reparser, language server, and tree-sitter crates — they are
+  trees those crates are designed to consume, and the adapters arrive with
+  LexerSketch; `dev/ROADMAP.md`'s note on `grammar-lang` was out of date.
+
+### Security
+
+- Hostile schematics could drive forging to gigabytes of memory: the token
+  sets are bitsets over every token kind, one or more per grammar
+  expression. The tables that grow with expressions times token kinds
+  (token sets and expression-rule operator tables) are now capped at
+  256 MiB, and a grammar that would exceed the cap is refused before they are
+  allocated. FIRST sets are shared wherever equal by construction and FOLLOW
+  sets are built only where read, so legitimate grammars use far less: the
+  30,000-keyword grammar in the regression suite went from about 480 MiB to
+  130 MiB peak. A 4 MB schematic of 32,000 keywords and 180,000 choices
+  (an estimated 6 GiB in 1.0.0) is refused in 250 ms at 76 MiB peak.
+- Schematics larger than 8 MiB are refused (1.0.0 accepted up to 4 GiB).
+- Schematic nesting limits multiplied: 64 levels of inline tables, each under
+  a 64-part dotted key, nested about 4,096 tables deep and overflowed a
+  256 KiB stack. Nesting is now limited to 64 levels in total, counting
+  header and dotted-key parts, arrays, and inline tables together.
+- Duplicate-key checks in the reader, and the duplicate-capability check,
+  scanned every earlier entry, which was quadratic in the size of a table.
+  They are now ordered-map lookups.
+
+### Changed
+
+- `#![deny(warnings)]` is removed from the crate root, so new compiler or
+  Clippy warnings no longer break downstream builds; CI keeps enforcing
+  `-D warnings` through `RUSTFLAGS`.
+- New tests: regressions for each fix, a property that a leading byte-order
+  mark changes nothing but offsets (source and schematic), a memo agreement
+  test across rescued spans, and `tests/memory.rs`, which measures peak heap
+  use with a counting allocator. New benchmark:
+  `parse/speculative/nested_60`.
+
+---
+
 ## [1.0.0] - 2026-10-07
 
 The API freeze. The 0.2.0 surface, the `.lsf` schematic format, and the
@@ -141,7 +217,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/lang-forge/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lang-forge/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/jamesgober/lang-forge/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jamesgober/lang-forge/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/jamesgober/lang-forge/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/lang-forge/releases/tag/v0.1.0

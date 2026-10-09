@@ -19,6 +19,9 @@ use crate::{
     schematic::{IdentMode, LexerSpec},
 };
 
+/// The UTF-8 byte-order mark, skipped as whitespace at the start of a source.
+pub(crate) const BOM: char = '\u{FEFF}';
+
 /// Kind indexes of the built-in token classes. Literal tokens follow them.
 pub(crate) const UNKNOWN: u16 = 0;
 pub(crate) const WHITESPACE: u16 = 1;
@@ -296,6 +299,15 @@ impl Lexer {
         // Source code averages a token every two to three bytes.
         tokens.reserve(bytes.len() / 2 + 1);
         let mut pos = 0;
+        // A leading byte-order mark is an encoding signature, not text: it
+        // opens the first whitespace token, together with any whitespace
+        // after it, so the tree keeps it (it stays lossless) and nothing
+        // reports it. A U+FEFF anywhere else is an ordinary character.
+        if let Some(rest) = src.strip_prefix(BOM) {
+            let end = self.space_end(src, src.len() - rest.len());
+            tokens.push(Token::new(self.k_whitespace, Span::new(0, end as u32)));
+            pos = end;
+        }
         while pos < bytes.len() {
             let class = self.class[bytes[pos] as usize];
             let (end, kind) = if class & C_FIXED != 0 {
@@ -998,6 +1010,30 @@ mod tests {
             ]
         );
         assert!(!syntax_lang::TokenKind::is_trivia(&lexer.builtin(NEWLINE)));
+    }
+
+    #[test]
+    fn test_lex_leading_byte_order_mark_is_whitespace() {
+        let lexer = lexer_with(&spec());
+        let (tokens, diags) = lex(&lexer, "\u{FEFF}  let x");
+        assert!(diags.is_empty());
+        assert_eq!(
+            tokens,
+            ["WHITESPACE:\u{FEFF}  ", "#7:let", "WHITESPACE: ", "IDENT:x"]
+        );
+        let (tokens, diags) = lex(&lexer, "\u{FEFF}");
+        assert!(diags.is_empty());
+        assert_eq!(tokens, ["WHITESPACE:\u{FEFF}"]);
+        // Significant line breaks stay their own tokens.
+        let mut s = spec();
+        s.newlines = true;
+        let lexer = lexer_with(&s);
+        let (tokens, _) = lex(&lexer, "\u{FEFF} \nx");
+        assert_eq!(tokens, ["WHITESPACE:\u{FEFF} ", "NEWLINE:\n", "IDENT:x"]);
+        // Anywhere else it is an unknown character.
+        let (tokens, diags) = lex(&lexer, "x\u{FEFF}");
+        assert_eq!(tokens, ["IDENT:x", "UNKNOWN:\u{FEFF}"]);
+        assert_eq!(diags.len(), 1);
     }
 
     #[test]

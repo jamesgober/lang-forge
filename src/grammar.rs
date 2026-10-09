@@ -41,6 +41,14 @@ const MAX_FACTOR_DEPTH: u32 = 64;
 /// The most precedence levels one expression rule may have.
 const MAX_LEVELS: usize = 255;
 
+/// The most memory the forged tables whose size grows with the number of
+/// expressions times the number of token kinds may take: the token sets
+/// (FIRST, FOLLOW, and recovery sets are bitsets over every token kind) and
+/// the operator tables of expression rules. Real grammars need well under a
+/// megabyte; one with 30,000 distinct keywords about 120 MB. A schematic
+/// that would need more is refused before anything that size is allocated.
+const MAX_TABLE_BYTES: usize = 256 << 20;
+
 /// Names that belong to built-in kinds and cannot name a rule or node.
 const RESERVED: [&str; 9] = [
     "UNKNOWN",
@@ -243,6 +251,19 @@ pub(crate) fn compile(
         .enumerate()
         .map(|(i, (text, _))| (*text, FIRST_LITERAL + i as u16))
         .collect();
+    let n_tokens = FIRST_LITERAL as usize + literals.len();
+    // Every expression rule has two operator tables of a byte per token kind;
+    // they count against the same budget as the token sets.
+    let pratt_rules = schematic
+        .rules
+        .iter()
+        .filter(|r| matches!(r.body, Body::Pratt(_)))
+        .count();
+    let pratt_bytes = pratt_rules.saturating_mul(2 * n_tokens);
+    if pratt_bytes > MAX_TABLE_BYTES {
+        too_large(report);
+        return None;
+    }
 
     let mut builder = Builder {
         exprs: Vec::new(),
@@ -257,7 +278,6 @@ pub(crate) fn compile(
     };
 
     // Kind names: tokens, then EOF and ERROR, then nodes.
-    let n_tokens = FIRST_LITERAL as usize + literals.len();
     let mut names: Vec<Box<str>> = BUILTIN_TOKENS
         .iter()
         .map(|n| Box::<str>::from(*n))
@@ -351,7 +371,15 @@ pub(crate) fn compile(
         report,
         ..
     } = builder;
-    let analysis = Analysis::new(exprs, items, spans, n_tokens + 1, report);
+    let analysis = Analysis::new(
+        exprs,
+        items,
+        spans,
+        n_tokens + 1,
+        schematic.rules.len(),
+        pratt_bytes,
+        report,
+    )?;
     let pratts: Vec<Pratt> = pratt_specs
         .into_iter()
         .map(|(operand, thens, (levels, prefix, after))| Pratt {
@@ -996,26 +1024,93 @@ struct Analysis<'r> {
     sets: Sets,
     first: Vec<SetId>,
     nullable: Vec<bool>,
+    /// By rule: its FIRST set.
+    rule_first: Vec<SetId>,
+    /// Bytes of other tables counted against `MAX_TABLE_BYTES`.
+    other_bytes: usize,
     report: &'r mut Report,
 }
 
+/// Where an expression's FIRST set comes from, when it is exactly another's.
+#[derive(Clone, Copy)]
+enum SameFirst {
+    Expr(u32),
+    Rule(u32),
+}
+
+/// Refuses a grammar whose tables would exceed `MAX_TABLE_BYTES`.
+fn too_large(report: &mut Report) {
+    report.error_help(
+        Span::empty(0),
+        format!(
+            "the grammar's tables would need more than {} MiB",
+            MAX_TABLE_BYTES >> 20
+        ),
+        "the parser's tables grow with the number of rules and alternatives times the number of distinct keywords and symbols",
+    );
+}
+
 impl<'r> Analysis<'r> {
+    /// Sets up the analysis, allocating every FIRST set — or refuses the
+    /// grammar, before allocating them, if they would not fit the budget.
     fn new(
         exprs: Vec<Expr>,
         items: Vec<u32>,
         spans: Vec<Span>,
         bits: usize,
+        rules: usize,
+        other_bytes: usize,
         report: &'r mut Report,
-    ) -> Self {
+    ) -> Option<Self> {
         let mut sets = Sets::new(bits);
-        // Every token expression of the same kind has the same FIRST set, so
-        // they share one: a grammar with thousands of literals would otherwise
-        // spend a full-width set on each mention of each.
-        let mut singletons = vec![NO_SET; bits];
-        let first = exprs
+        // A set is shared wherever two FIRST sets are equal by construction,
+        // so the tables grow with the grammar's choices, not its every
+        // expression: every token expression of a kind shares one set; a rule
+        // reference has its rule's set; `x*`, `x+`, and `x?` have `x`'s; and
+        // a sequence that begins with a token has that token's. Sharing is
+        // safe because the fixpoint only ever unions into a set, and a set
+        // unioned with itself is unchanged.
+        let same: Vec<Option<SameFirst>> = exprs
             .iter()
-            .map(|expr| match *expr {
-                Expr::Token(kind) => {
+            .enumerate()
+            .map(|(e, expr)| match *expr {
+                Expr::Rule(r) => Some(SameFirst::Rule(r)),
+                // Children sit before their parents.
+                Expr::Repeat { body, .. } | Expr::Optional(body) if (body as usize) < e => {
+                    Some(SameFirst::Expr(body))
+                }
+                Expr::Seq { start, len } if len > 0 => {
+                    let head = items[start as usize];
+                    (matches!(exprs[head as usize], Expr::Token(_)) && (head as usize) < e)
+                        .then_some(SameFirst::Expr(head))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut kinds_used = vec![false; bits];
+        let mut needed = rules;
+        for (expr, same) in exprs.iter().zip(&same) {
+            match (*expr, same) {
+                (Expr::Token(kind), _) => {
+                    if !core::mem::replace(&mut kinds_used[kind as usize], true) {
+                        needed += 1;
+                    }
+                }
+                (_, Some(_)) => {}
+                (_, None) => needed += 1,
+            }
+        }
+        if other_bytes.saturating_add(sets.bytes_for(needed)) > MAX_TABLE_BYTES {
+            too_large(report);
+            return None;
+        }
+
+        let rule_first: Vec<SetId> = (0..rules).map(|_| sets.alloc()).collect();
+        let mut singletons = vec![NO_SET; bits];
+        let mut first: Vec<SetId> = Vec::with_capacity(exprs.len());
+        for (expr, same) in exprs.iter().zip(&same) {
+            let set = match (*expr, *same) {
+                (Expr::Token(kind), _) => {
                     let slot = &mut singletons[kind as usize];
                     if *slot == NO_SET {
                         *slot = sets.alloc();
@@ -1023,19 +1118,24 @@ impl<'r> Analysis<'r> {
                     }
                     *slot
                 }
-                _ => sets.alloc(),
-            })
-            .collect();
+                (_, Some(SameFirst::Rule(r))) => rule_first[r as usize],
+                (_, Some(SameFirst::Expr(c))) => first[c as usize],
+                (_, None) => sets.alloc(),
+            };
+            first.push(set);
+        }
         let nullable = vec![false; exprs.len()];
-        Self {
+        Some(Self {
             exprs,
             items,
             spans,
             sets,
             first,
             nullable,
+            rule_first,
+            other_bytes,
             report,
-        }
+        })
     }
 
     fn children(&self, start: u32, len: u32) -> &[u32] {
@@ -1051,8 +1151,8 @@ impl<'r> Analysis<'r> {
         error: Kind,
         schematic: &Schematic<'_>,
     ) -> Option<Program> {
-        for rule in &mut rules {
-            rule.first = self.sets.alloc();
+        for (rule, &first) in rules.iter_mut().zip(&self.rule_first) {
+            rule.first = first;
         }
         let owned = self.rule_exprs(&rules, &pratts);
         let order = self.rule_order(&owned);
@@ -1066,7 +1166,7 @@ impl<'r> Analysis<'r> {
             return None;
         }
         let start = start?;
-        let sync = self.follow_sets(&rules, &pratts, start, eof, &owned, &order);
+        let sync = self.follow_sets(&rules, &pratts, start, eof, &owned, &order)?;
         Some(Program {
             exprs: self.exprs.into(),
             items: self.items.into(),
@@ -1408,8 +1508,12 @@ impl<'r> Analysis<'r> {
     /// may legitimately come after it, at which recovery stops skipping.
     /// Returns the per-slot synchronization sets of every sequence.
     ///
-    /// Token expressions need no FOLLOW set and get none, and the per-slot
-    /// sets of sequences are materialized only for slots that recurse.
+    /// Token expressions need no FOLLOW set and get none, and neither does
+    /// an expression with no rule reference or repetition inside it: FOLLOW
+    /// is read only to pass it on to a rule and to stop a repetition, so
+    /// such an expression's FOLLOW set would never be read. The per-slot sets
+    /// of sequences are materialized only for slots that need them. Returns
+    /// `None`, having reported it, if the sets would exceed the budget.
     fn follow_sets(
         &mut self,
         rules: &[Rule],
@@ -1418,43 +1522,82 @@ impl<'r> Analysis<'r> {
         eof: u16,
         owned: &[Vec<u32>],
         order: &[u32],
-    ) -> Box<[SetId]> {
+    ) -> Option<Box<[SetId]>> {
         let n = self.exprs.len();
         let is_token = |exprs: &[Expr], e: usize| matches!(exprs[e], Expr::Token(_));
+        // Whether an expression's FOLLOW set is read: true of rule
+        // references and repetitions, and of everything that contains one.
+        // Each rule's list has children before parents.
+        let mut needs = vec![false; n];
+        for &e in owned.iter().flatten() {
+            needs[e as usize] = match self.exprs[e as usize] {
+                Expr::Token(_) => false,
+                Expr::Rule(_) | Expr::Repeat { .. } => true,
+                Expr::Optional(body) => needs[body as usize],
+                Expr::Seq { start, len } | Expr::Choice { start, len } => {
+                    self.children(start, len).iter().any(|&c| needs[c as usize])
+                }
+            };
+        }
+
+        // Count the sets before allocating any, against the budget.
+        let mut count = rules.len() + pratts.len();
+        for &e in owned.iter().flatten() {
+            count += usize::from(needs[e as usize]);
+            if let Expr::Seq { start, len } = self.exprs[e as usize] {
+                for &item in self.children(start, len) {
+                    if !is_token(&self.exprs, item as usize) {
+                        // At most an after-first set and a sync set.
+                        count += 1 + usize::from(needs[item as usize]);
+                    }
+                }
+            }
+        }
+        let used = self.other_bytes.saturating_add(self.sets.bytes());
+        if used.saturating_add(self.sets.bytes_for(count)) > MAX_TABLE_BYTES {
+            too_large(self.report);
+            return None;
+        }
+
         let mut follow = vec![NO_SET; n];
         for &e in owned.iter().flatten() {
-            if !is_token(&self.exprs, e as usize) {
+            if needs[e as usize] {
                 follow[e as usize] = self.sets.alloc();
             }
         }
         let rule_follow: Vec<SetId> = (0..rules.len()).map(|_| self.sets.alloc()).collect();
         let _ = self.sets.insert(rule_follow[start as usize], eof as usize);
 
-        // Per sequence slot that recurses: FIRST of what comes after it and
+        // Per sequence slot that needs them: FIRST of what comes after it and
         // whether all of that can match nothing (for FOLLOW), and FIRST of
-        // every later item (the synchronization set for recovery).
+        // every later item (the synchronization set for recovery, needed by
+        // every slot that is not a token).
         let mut after_first = vec![NO_SET; self.items.len()];
         let mut after_nullable = vec![false; self.items.len()];
         let mut sync = vec![NO_SET; self.items.len()];
+        let mut rest = self.sets.scratch();
+        let mut later = self.sets.scratch();
         for list in owned {
             for &e in list {
                 let Expr::Seq { start, len } = self.exprs[e as usize] else {
                     continue;
                 };
-                let mut rest = self.sets.scratch();
-                let mut later = self.sets.scratch();
+                Sets::clear_scratch(&mut rest);
+                Sets::clear_scratch(&mut later);
                 let mut nullable = true;
                 for k in (start..start + len).rev() {
                     let item = self.items[k as usize] as usize;
                     if !is_token(&self.exprs, item) {
-                        after_first[k as usize] = self.sets.alloc_from(&rest);
-                        after_nullable[k as usize] = nullable;
+                        if needs[item] {
+                            after_first[k as usize] = self.sets.alloc_from(&rest);
+                            after_nullable[k as usize] = nullable;
+                        }
                         if later.iter().any(|w| *w != 0) {
                             sync[k as usize] = self.sets.alloc_from(&later);
                         }
                     }
                     if !self.nullable[item] {
-                        rest.iter_mut().for_each(|w| *w = 0);
+                        Sets::clear_scratch(&mut rest);
                         nullable = false;
                     }
                     self.sets.or_into(&mut rest, self.first[item]);
@@ -1547,7 +1690,7 @@ impl<'r> Analysis<'r> {
                 };
             }
         }
-        sync.into()
+        Some(sync.into())
     }
 }
 

@@ -116,8 +116,22 @@ fn bench_parse(c: &mut Criterion) {
         statements.push_str("total = f(total, { x = 1; y + { z; }; }) + 2;\ncount(total);\n");
     }
 
+    // The same kind of statements nested 60 blocks deep: every level's first
+    // alternative fails only after parsing the whole level, so each level is
+    // rewound and replayed — the memo's worst case.
+    let mut nested = String::new();
+    for _ in 0..60 {
+        nested.push_str("{ ");
+        for i in 0..200 {
+            nested.push_str(&format!("f(x{i}) + 1; "));
+        }
+    }
+    nested.push_str("x;");
+    nested.push_str(&" };".repeat(60));
+
     let inputs = [
         ("speculative/256KB", &speculative, statements),
+        ("speculative/nested_60", &speculative, nested),
         ("mini/4KB", &mini, mini_source(4 << 10)),
         ("mini/1MB", &mini, mini_source(1 << 20)),
         ("json/1MB", &json, json_source(1 << 20)),

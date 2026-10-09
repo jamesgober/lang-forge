@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "lang-forge"
-version = "1.0.0"
+version = "1.0.1"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -53,8 +53,9 @@ std = ["syntax-lang/std", "diag-lang/std", "pass-lang/std"]
 # #################################
 [dependencies]
 # The family's lossless concrete syntax tree. A forged language parses into a
-# `syntax_lang::Node`, so its trees feed the formatter, incremental reparser,
-# language server, and tree-sitter crates of the family unchanged.
+# `syntax_lang::Node`, the tree the family's formatter, incremental reparser,
+# language server, and tree-sitter crates are designed to consume (the adapters
+# that connect them arrive with LexerSketch).
 syntax-lang = { version = "1", default-features = false }
 # Diagnostics. Schematic errors and parse errors are `diag_lang::Diagnostic`s
 # with labelled spans, rendered with source context by `diag_lang::Renderer`.

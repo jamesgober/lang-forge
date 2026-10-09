@@ -79,9 +79,10 @@ source text into a lossless [`syntax_lang`](https://docs.rs/syntax-lang) tree.
 Parsing never fails. Malformed input yields a complete tree — missing pieces
 left out, unexpected tokens wrapped in `ERROR` nodes — and one diagnostic per
 problem. The tree always covers every byte of the source, so it can be printed
-back exactly, and it is the family's lossless CST, so the formatter,
+back exactly. It is the family's lossless CST, the tree the formatter,
 incremental reparser, language server, and tree-sitter crates of the `-lang`
-family take it as it is.
+family are designed to consume; the adapters that connect a forged language to
+those crates are not part of lang-forge and arrive with LexerSketch.
 
 ## Installation
 
@@ -364,6 +365,25 @@ types, includes — are refused: a schematic must forge the same language
 wherever it is forged. Arrays of tables (`[[...]]`) are not used. Strings in a
 schematic are not interpolated.
 
+What NOML and TOML call invalid is refused, even where no setting would read
+it: a table defined by dotted keys (`expr.operand = "..."`) cannot be defined
+again by a header (`[rules.expr]`), though a header may add a sub-table to it;
+a key cannot be a multi-line string; and a number, date, or time must have
+one of TOML's forms (`1_000`, `0x1F`, `6.02e23`, `inf`, `1979-05-27`,
+`07:32:00`, ...) — `1abc` or a lone `-` is an error, not a number. No setting
+takes a number, date, or time, so a well-formed one is reported as the wrong
+type.
+
+A leading UTF-8 byte-order mark is skipped; spans still count it.
+
+Limits: a schematic is at most 8 MiB, and nests at most 64 levels deep,
+counting every level together — each part of a `[header]` or dotted key, each
+array, and each inline table (real schematics nest four or five). The parser
+tables that grow with the number of rules and alternatives times the number of
+distinct keywords and symbols are capped at 256 MiB; a grammar that would need
+more is refused before they are allocated. Real grammars need well under a
+megabyte; 30,000 keywords need about 120 MB.
+
 ## Concepts
 
 ### Tokens and the derived lexer
@@ -382,6 +402,11 @@ token for every piece of the source; none is dropped.
 | `WHITESPACE` | Spaces, tabs, form feeds, and line breaks (unless they are `NEWLINE`), plus Unicode's other pattern whitespace. Trivia. |
 | `COMMENT` | A line or block comment, delimiters included. Trivia. |
 | `UNKNOWN` | A run of characters that begins no token, reported once. Trivia, so the parser carries on around it. |
+
+A UTF-8 byte-order mark (U+FEFF) at the very start of the source is not an
+`UNKNOWN` character: it begins the first `WHITESPACE` token, together with any
+whitespace after it, so the tree keeps it and nothing reports it. Elsewhere,
+U+FEFF is an unexpected character.
 
 Literals must be lexable as themselves: a literal cannot be empty, contain
 whitespace, start with a digit, or start like an identifier and then continue
@@ -426,7 +451,12 @@ work as possible:
   and position for as long as the outermost speculation lasts, so alternatives
   that share a prefix through different rules — `assign = expr '=' expr ';'`
   against `expr ';'` — parse that prefix once. Without this, nested input
-  would cost time exponential in its depth; with it, parsing stays linear.
+  would cost time exponential in its depth; with it, parsing stays linear in
+  the input (at most, each level of speculative nesting replays what it holds
+  once more). The memo's memory stays proportional to the input however deeply
+  it nests: remembered events stay where the parser produced them and are
+  moved only when a rewind would discard them, once, with nested replays kept
+  as references.
 - **Left-factoring.** Adjacent alternatives that begin with the same elements
   are merged when the language is forged — `x a | x b` becomes `x (a | b)` —
   which keeps ordered choice's meaning while reading `x` only once.
@@ -453,7 +483,9 @@ Parsing always completes:
   one error.
 - **Input after the start rule** is wrapped in one `ERROR` node with one error.
 - **Input nested too deeply** is reported once and not followed, so no input
-  can exhaust the stack. Every recursive step of the parser counts against a
+  can exhaust the stack. While speculating over such input, each decision
+  tries only its first viable alternative, which keeps that speculation
+  linear; the code after it is parsed in full. Every recursive step of the parser counts against a
   limit of 768 grammar levels, which needs at most about 256 KiB of stack in a
   release build and 768 KiB in a debug build — within every default thread,
   including the 1 MiB Windows main thread — and allows well over a hundred
@@ -469,11 +501,11 @@ just the first. The checks, by stage:
 
 | Stage | Refused |
 |---|---|
-| Reading | NOML syntax errors; duplicate keys and tables; NOML's dynamic features; arrays of tables; inputs over 4 GiB. |
-| Layout | Unknown tables or keys; missing `[language]`, `name`, or `[rules]`; wrong value types; blank names; extensions with a dot; empty or misshapen delimiters; a multi-character escape; empty or duplicate capability names. |
+| Reading | NOML syntax errors; duplicate keys and tables; a header redefining a table defined by dotted keys; multi-line string keys; malformed numbers, dates, and times; NOML's dynamic features; arrays of tables; more than 64 levels of nesting; schematics over 8 MiB. |
+| Layout | Unknown tables or keys; missing `[language]`, `name`, or `[rules]`; wrong value types; blank names; extensions with a dot; empty or misshapen delimiters (a block comment is exactly two strings); a multi-character escape; empty or duplicate capability names. |
 | Rules | Malformed rule text; invalid or reserved rule and node names; undefined rules (with a suggestion); token classes that are not available (`STRING` without strings, `NEWLINE` without `newlines = true`) or are trivia; literals the lexer cannot produce; a keyword that is also a rule name; an operator twice in the same position; a hidden or undefined start rule. |
 | Lexer | A text used for two things (symbol and comment, comment and string, ...); comment and string delimiters the lexer could never reach. |
-| Grammar | Left recursion, direct or through other rules (named as a chain, `a → b → a`); `*` or `+` over something that can match nothing; an expression operand that can match nothing; alternatives that can never match. |
+| Grammar | Left recursion, direct or through other rules (named as a chain, `a → b → a`); `*` or `+` over something that can match nothing; an expression operand that can match nothing; alternatives that can never match; parser tables over 256 MiB. |
 
 ## `Language`
 
@@ -697,9 +729,12 @@ assert_eq!(parse.tree().descendants().filter(|n| *n.kind() == assign).count(), 3
 pub fn kind_name(&self, kind: Kind) -> &str
 ```
 
-The name of `kind`: the inverse of [`kind`](#languagekind). Returns
-`"<unknown>"` for a kind this language does not have, which can only come from
-another language.
+The name of `kind`: the inverse of [`kind`](#languagekind).
+
+A kind is only meaningful to the language that made it. Given a kind from
+another language, `kind_name` cannot tell: it returns whatever name this
+language has at that kind's position in its kind table — usually a wrong one —
+or `"<unknown>"` when this language has fewer kinds than that.
 
 | Parameter | Meaning |
 |---|---|
@@ -713,6 +748,13 @@ let parse = lang.parse("go 7");
 let names: Vec<&str> = parse.tree().tokens().map(|t| lang.kind_name(*t.kind())).collect();
 assert_eq!(names, ["go", "WHITESPACE", "NUMBER"]);
 assert_eq!(lang.kind_name(*parse.tree().kind()), "item");
+
+// Another language's kinds get a wrong name, or none.
+let other = Language::from_lsf(
+    "[language]\nname = \"y\"\n[rules]\nlist = \"'[' (pair (',' pair)*)? ']'\"\npair = \"IDENT ':' NUMBER\"\n",
+)?;
+assert_eq!(lang.kind_name(other.kind("[").expect("a symbol")), "go");
+assert_eq!(lang.kind_name(other.kind("pair").expect("a rule")), "<unknown>");
 # Ok::<(), lang_forge::Error>(())
 ```
 
@@ -1464,8 +1506,12 @@ As of `1.0.0` the public API is frozen. lang-forge follows
   [The schematic](#the-schematic) keeps its meaning, and the rule language and
   expression rules keep theirs. New keys and new rule-language forms may be
   added in a minor release. A schematic that forges under one `1.x` release
-  forges under every later one, with one exception: a schematic a later
-  release finds would hang or crash the parser may be refused, as a bug fix.
+  forges under every later one, with two exceptions, both bug fixes: a
+  schematic a later release finds would hang or crash the parser, or exhaust
+  memory past the documented limits, may be refused; and a schematic that is
+  not valid NOML (which 1.0.0 accepted by mistake, for example a table
+  redefined by a header after dotted keys, a multi-line key, or a malformed
+  number) may be refused. 1.0.1 applies both; see its release notes.
 - The **trees for valid input** hold: for input that parses without an error,
   the tree — its nodes, their kinds and names, and where trivia sits — is
   fixed by the schematic and the rules in [How parsing decides](#how-parsing-decides)

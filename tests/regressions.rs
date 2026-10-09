@@ -255,3 +255,212 @@ fn test_realistic_nesting_fits_under_the_limit() {
         }
     });
 }
+
+// ----- 1.0.1 -----
+
+/// Statements that begin alike (an assignment and an expression statement
+/// both begin with an expression), plus a `let` form that never speculates.
+fn speculative_language() -> Language {
+    forge(
+        "file = \"stmt*\"\nstmt = \"assign | expr ';' | 'let' expr ';'\"\n\
+         assign = \"expr '=' expr ';'\"\nblock = \"'{' stmt* '}'\"\n\
+         [rules.expr]\noperand = \"IDENT | NUMBER | block | '(' expr ')'\"\n\
+         levels = [{ left = [\"+\"] }]\n",
+    )
+}
+
+#[test]
+fn test_depth_limit_does_not_cripple_later_speculation() {
+    // Once one construct hit the depth limit, every later choice tried only
+    // its first alternative, so `x;` (which needs the second) was an error.
+    let tails = "x;\ny = 1;\nz + 2;\n";
+    let lang = speculative_language();
+    assert!(!lang.parse(tails).has_errors());
+    let results = on_stack(1024, move || {
+        let nest = format!("{}1{}", "(".repeat(1_000), ")".repeat(1_000));
+        // Deep inside a statement that speculates, and inside one that does not.
+        [format!("{nest};"), format!("let {nest};")].map(|head| {
+            let src = format!("{head}\n{tails}");
+            let parse = lang.parse(&src);
+            let lossless = parse.tree().text(&src) == Some(src.as_str());
+            let deep = parse
+                .diagnostics()
+                .iter()
+                .any(|d| d.message().contains("nested too deeply"));
+            // Every error lies inside the deep construct, none in the tail.
+            let contained = parse
+                .diagnostics()
+                .iter()
+                .all(|d| d.primary().span().end().to_usize() <= head.len());
+            (lossless, deep, contained)
+        })
+    });
+    assert_eq!(results, [(true, true, true); 2]);
+}
+
+#[test]
+fn test_depth_limit_still_bounds_speculation_time() {
+    // What the flag exists for: within one speculation, input past the depth
+    // limit must not make every level try every alternative.
+    let lang = speculative_language();
+    let started = Instant::now();
+    let reported = on_stack(4096, move || {
+        let mut src = String::new();
+        for _ in 0..20 {
+            src.push_str(&format!("{}x;{}\n", "{ ".repeat(400), "};".repeat(400)));
+        }
+        lang.parse(&src)
+            .diagnostics()
+            .iter()
+            .filter(|d| d.message().contains("nested too deeply"))
+            .count()
+    });
+    assert_eq!(reported, 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn test_nested_speculation_stays_linear_in_depth() {
+    // Blocks nested in blocks, where every level's statement first tries the
+    // alternative that fails only after parsing the whole level. The memo
+    // used to copy each level's events again at every enclosing level.
+    let lang = speculative_language();
+    let source = |depth: usize| {
+        let width = 12_000 / depth;
+        let mut src = String::new();
+        for _ in 0..depth {
+            src.push_str("{ ");
+            for i in 0..width {
+                src.push_str(&format!("x{i} + 1; "));
+            }
+        }
+        src.push_str("x;");
+        src.push_str(&" };".repeat(depth));
+        src
+    };
+    let time = |depth: usize| {
+        let lang = lang.clone();
+        let src = source(depth);
+        on_stack(4096, move || {
+            let started = Instant::now();
+            let parse = lang.parse(&src);
+            (parse.has_errors(), started.elapsed())
+        })
+    };
+    let (flat_errors, flat) = time(1);
+    let (nested_errors, nested) = time(60);
+    assert!(!flat_errors && !nested_errors);
+    // The same statements, nested 60 deep: replaying each level once costs
+    // a few times more, not sixty.
+    assert!(
+        nested < flat * 12 + Duration::from_millis(250),
+        "flat {flat:?}, nested {nested:?}"
+    );
+}
+
+#[test]
+fn test_hostile_schematic_tables_are_refused_before_allocation() {
+    // 30,000 distinct keywords and 100,000 optional choices between them:
+    // about 2.4 MB of schematic whose token sets would have taken gigabytes.
+    let mut rules = String::new();
+    for r in 0..100 {
+        rules.push_str(&format!("r{r} = \""));
+        for g in r * 1000..(r + 1) * 1000 {
+            let (a, b) = ((2 * g) % 30_000, (2 * g + 1) % 30_000);
+            rules.push_str(&format!("('k{a}' | 'k{b}')? "));
+        }
+        rules.push_str("\"\n");
+    }
+    let started = Instant::now();
+    let err = Language::from_lsf(&format!("[language]\nname = \"h\"\n[rules]\n{rules}"))
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(
+        err.diagnostics()[0].message(),
+        "the grammar's tables would need more than 256 MiB"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn test_many_expression_rules_count_against_the_table_budget() {
+    // Each expression rule has two operator tables over every token kind.
+    let literals: Vec<String> = (0..15_000).map(|i| format!("'k{i}'")).collect();
+    let mut rules = format!("a = \"{}\"\n", literals.join(" "));
+    for i in 0..15_000 {
+        rules.push_str(&format!("[rules.e{i}]\noperand = \"'k{i}'\"\n"));
+    }
+    let err = Language::from_lsf(&format!("[language]\nname = \"p\"\n[rules]\n{rules}"))
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(
+        err.diagnostics()[0].message(),
+        "the grammar's tables would need more than 256 MiB"
+    );
+}
+
+#[test]
+fn test_oversized_schematic_is_refused() {
+    let schematic = format!(
+        "[language]\nname = \"big\"\n[rules]\na = \"NUMBER\"\n{}",
+        "# padding\n".repeat(900_000)
+    );
+    let err = Language::from_lsf(&schematic).map(|_| ()).unwrap_err();
+    assert_eq!(
+        err.diagnostics()[0].message(),
+        "the schematic is larger than 8 MiB"
+    );
+}
+
+#[test]
+fn test_nesting_bomb_schematic_is_refused_on_a_small_stack() {
+    // 64 inline tables, each under a 64-part dotted key: each limit allowed
+    // its 64 levels, so together they nested about 4,096 tables deep.
+    let key = vec!["k"; 64].join(".");
+    let mut bomb = String::from("1");
+    for _ in 0..64 {
+        bomb = format!("{{ {key} = {bomb} }}");
+    }
+    let message = on_stack(256, move || {
+        Language::from_lsf(&format!("[lexer]\nx = {bomb}\n"))
+            .map(|_| ())
+            .unwrap_err()
+            .diagnostics()[0]
+            .message()
+            .to_owned()
+    });
+    assert_eq!(message, "the schematic nests more than 64 levels deep");
+}
+
+#[test]
+fn test_byte_order_mark_is_trivia_in_source_and_schematic() {
+    let bom = '\u{FEFF}';
+    let lang = Language::from_lsf(&format!(
+        "{bom}[language]\nname = \"b\"\n[lexer]\nline_comments = [\"#\"]\n[rules]\nfile = \"IDENT*\"\n"
+    ))
+    .unwrap_or_else(|e| panic!("{e}"));
+    for rest in ["a b", "  a b", "", "# c\na", "\n\nb"] {
+        let src = format!("{bom}{rest}");
+        let parse = lang.parse(&src);
+        assert!(!parse.has_errors(), "{src:?}: {:?}", parse.diagnostics());
+        assert_eq!(parse.tree().text(&src), Some(src.as_str()));
+        // The mark opens the first whitespace token, with any that follows.
+        let first = lang.lex(&src)[0];
+        assert_eq!(lang.kind_name(*first.kind()), "WHITESPACE");
+        let space = rest.len() - rest.trim_start().len();
+        assert_eq!(first.span().end().to_usize(), 3 + space, "{src:?}");
+    }
+    // Only a leading one: elsewhere U+FEFF is an unexpected character.
+    assert_eq!(
+        messages(&lang, &format!("a {bom}b")),
+        [format!("unexpected character `{bom}`")]
+    );
+}

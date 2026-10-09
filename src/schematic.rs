@@ -13,10 +13,11 @@
 //! line_comments   = ["//"]
 //! block_comments  = [["/*", "*/"]]
 //! nested_comments = false
-//! strings         = ['"', { open = "r\"", close = "\"", escape = "" }]
+//! strings         = ['"', { open = "#\"", close = "\"#", escape = "" }]
 //!
 //! [rules]             # required
 //! program = "stmt*"
+//! stmt    = "expr ';'"
 //!
 //! [rules.expr]        # a Pratt expression rule
 //! operand = "NUMBER | '(' expr ')'"
@@ -30,7 +31,7 @@
 //! problem is reported — an unknown key is far more often a typo than an
 //! intention, so it is an error rather than something to ignore.
 
-use alloc::{borrow::Cow, format, vec::Vec};
+use alloc::{borrow::Cow, collections::BTreeSet, format, vec::Vec};
 
 use syntax_lang::Span;
 
@@ -351,12 +352,28 @@ fn block_comment<'s>(item: Value<'s>, report: &mut Report) -> Option<BlockSpec<'
         shape_error(report);
         return None;
     };
-    let mut texts = pair.into_iter().filter_map(|v| match v.kind {
-        ValueKind::Str(t) => Some(t.text),
-        _ => None,
-    });
-    let (Some(open), Some(close), None) = (texts.next(), texts.next(), texts.next()) else {
+    // Exactly two items, both strings: anything else in the pair is an
+    // error, never silently dropped.
+    if pair.len() != 2 {
         shape_error(report);
+        return None;
+    }
+    let mut texts = Vec::with_capacity(2);
+    for v in pair {
+        match v.kind {
+            ValueKind::Str(t) => texts.push(t.text),
+            other => report.error_help(
+                v.span,
+                format!(
+                    "a block comment delimiter must be a string, found {}",
+                    item_type(&other)
+                ),
+                "write it as [\"/*\", \"*/\"]",
+            ),
+        }
+    }
+    let mut texts = texts.into_iter();
+    let (Some(open), Some(close)) = (texts.next(), texts.next()) else {
         return None;
     };
     if open.is_empty() || close.is_empty() {
@@ -597,6 +614,9 @@ fn operator_list<'s>(entry: Entry<'s>, report: &mut Report) -> Vec<(Cow<'s, str>
 
 fn read_capabilities<'s>(t: Table<'s>, report: &mut Report) -> Vec<(Cow<'s, str>, Span)> {
     let mut include = Vec::new();
+    // Names already included, for a duplicate check that stays O(log n) per
+    // name rather than a scan of the list.
+    let mut seen: BTreeSet<Cow<'s, str>> = BTreeSet::new();
     for entry in t.entries {
         match &*entry.key {
             "include" => {
@@ -608,7 +628,7 @@ fn read_capabilities<'s>(t: Table<'s>, report: &mut Report) -> Vec<(Cow<'s, str>
                             span,
                             format!("capability name `{name}` has surrounding whitespace"),
                         );
-                    } else if include.iter().any(|(n, _)| *n == name) {
+                    } else if !seen.insert(name.clone()) {
                         report.error(span, format!("capability `{name}` is included twice"));
                     } else {
                         include.push((name, span));
@@ -706,4 +726,34 @@ fn strings<'s>(entry: Entry<'s>, report: &mut Report) -> Vec<(Cow<'s, str>, Span
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::panic)]
+
+    use alloc::string::String;
+
+    /// The layout example at the top of this module is a schematic that
+    /// forges, so the documentation cannot drift into one that does not.
+    #[test]
+    fn test_module_example_forges() {
+        let mut example = String::new();
+        let mut inside = false;
+        for line in include_str!("schematic.rs").lines() {
+            match line.trim_end() {
+                "//! ```toml" => inside = true,
+                "//! ```" if inside => break,
+                line if inside => {
+                    let text = line.strip_prefix("//!").unwrap_or(line);
+                    example.push_str(text.strip_prefix(' ').unwrap_or(text));
+                    example.push('\n');
+                }
+                _ => {}
+            }
+        }
+        let lang = crate::Language::from_lsf(&example).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(lang.name(), "calc");
+        assert!(!lang.parse("-(1 + 2) * 3; 4 / 5;").has_errors());
+    }
 }

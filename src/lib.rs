@@ -12,10 +12,12 @@
 //! language is ready the moment the schematic is forged.
 //!
 //! lang-forge is the capstone of the `-lang` language-construction family. Its
-//! trees are the family's lossless CST, so a forged language plugs straight
-//! into the formatter, incremental reparser, language server, and tree-sitter
-//! crates; its diagnostics render with `diag-lang`; and its capabilities run
-//! on `pass-lang`.
+//! trees are `syntax-lang` trees, the family's lossless CST, which the
+//! formatter, incremental reparser, language server, and tree-sitter crates
+//! are designed to consume; the adapters that connect a forged language to
+//! those crates are not part of lang-forge and arrive with LexerSketch. Its
+//! diagnostics render with `diag-lang`, and its capabilities run on
+//! `pass-lang`.
 //!
 //! ## A first language
 //!
@@ -112,7 +114,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![forbid(unsafe_code)]
-#![deny(warnings)]
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(unused_must_use)]

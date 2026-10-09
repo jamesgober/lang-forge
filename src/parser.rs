@@ -159,12 +159,35 @@ struct MemoEntry {
     end: u32,
     /// The furthest position the attempt looked at.
     reach: u32,
-    /// The attempt's events in `Memo::events`.
+    /// Where the attempt's events are. While they are still in the parser's
+    /// event list (`saved` unset), they are `from..from + len` there. Once a
+    /// rewind has rescued them, they are items `from..from + len` of
+    /// `Memo::saved`, whose forward links count from `origin`.
     from: u32,
     len: u32,
+    origin: u32,
+    saved: bool,
 }
 
 const FAILED: u32 = u32::MAX;
+
+/// One item of a rescued span of events.
+#[derive(Clone, Copy)]
+enum Saved {
+    /// An event. A forward link counts from the start of the span.
+    Event(Event),
+    /// The events of a remembered attempt, replayed at this point.
+    Entry(u32),
+}
+
+/// A remembered attempt replayed into the event list: `len` events from
+/// `start` are a copy of entry `entry`'s.
+#[derive(Clone, Copy)]
+struct Replay {
+    start: u32,
+    len: u32,
+    entry: u32,
+}
 
 /// Results of strict rule attempts, so speculation never parses the same rule
 /// at the same position twice: without it, alternatives that share a prefix
@@ -175,19 +198,43 @@ const FAILED: u32 = u32::MAX;
 /// valid for as long as they are kept. They are dropped when the outermost
 /// speculation ends, which bounds the memory to the work of one speculation;
 /// a generation stamp makes that drop O(1).
+///
+/// A successful attempt's events are not copied when it is remembered: the
+/// entry is a range of the parser's event list, where they already are. Only
+/// when a failed alternative rewinds that list are the events about to be cut
+/// off rescued into `saved`, once for every entry inside the rewound span,
+/// and any part of the span that is itself a replayed attempt is kept as a
+/// reference to that attempt rather than copied again. So each event the
+/// parser produces is stored at most once, however deeply the rules that
+/// produced it nest: copying the events of every success, at every level,
+/// cost memory proportional to the input times its nesting depth.
 #[derive(Default)]
 struct Memo {
     /// By token position: the generation and newest entry (plus one).
     heads: Vec<(u32, u32)>,
     generation: u32,
     entries: Vec<MemoEntry>,
-    /// Events of successful attempts; forward links are relative to the
-    /// attempt's first event.
-    events: Vec<Event>,
+    /// Rescued spans: events and references to replayed entries.
+    saved: Vec<Saved>,
+    /// The entries whose events are still in the parser's event list, in the
+    /// order they were made. That is also the order their events end in: an
+    /// entry is made when its rule finishes, at the end of the list, and a
+    /// rewind rescues every entry it would cut into.
+    live: Vec<u32>,
+    /// Replays still in the event list, in order. Replays never overlap: a
+    /// replay records only the entry it expands, not the entries inside.
+    replays: Vec<Replay>,
+    /// Scratch for `rescue`: the entries it moves, and boundary positions.
+    doomed: Vec<u32>,
+    bounds: Vec<(u32, u32)>,
+    /// Scratch for `expand`: the rescued spans being replayed, innermost
+    /// last, as (next item, end item, origin, base).
+    frames: Vec<(u32, u32, u32, u32)>,
 }
 
 impl Memo {
-    fn get(&self, rule: u32, pos: usize) -> Option<MemoEntry> {
+    /// The entry for `rule` at `pos`, and its index.
+    fn get(&self, rule: u32, pos: usize) -> Option<(u32, MemoEntry)> {
         let &(generation, head) = self.heads.get(pos)?;
         if generation != self.generation {
             return None;
@@ -196,7 +243,7 @@ impl Memo {
         while at != 0 {
             let entry = self.entries[at as usize - 1];
             if entry.rule == rule {
-                return Some(entry);
+                return Some((at - 1, entry));
             }
             at = entry.next;
         }
@@ -210,8 +257,152 @@ impl Memo {
         }
         let head = &mut self.heads[pos];
         entry.next = if head.0 == self.generation { head.1 } else { 0 };
+        if !entry.saved {
+            debug_assert!(self.live.last().is_none_or(|&i| {
+                let last = &self.entries[i as usize];
+                last.from + last.len <= entry.from + entry.len
+            }));
+            self.live.push(self.entries.len() as u32);
+        }
         self.entries.push(entry);
         *head = (self.generation, self.entries.len() as u32);
+    }
+
+    /// Appends entry `index`'s events to `events`, expanding the references
+    /// in rescued spans with an explicit stack (they nest as deeply as the
+    /// rules did), and relocating forward links to where the events land.
+    fn expand(&mut self, index: u32, events: &mut Vec<Event>) {
+        self.frames.clear();
+        let mut next = Some(index);
+        loop {
+            if let Some(index) = next.take() {
+                let entry = self.entries[index as usize];
+                let base = events.len() as u32;
+                if entry.saved {
+                    self.frames
+                        .push((entry.from, entry.from + entry.len, entry.origin, base));
+                } else {
+                    let range = entry.from as usize..(entry.from + entry.len) as usize;
+                    events.extend_from_within(range);
+                    for event in &mut events[base as usize..] {
+                        *event = relocate(*event, entry.from, base);
+                    }
+                }
+            }
+            let Some(frame) = self.frames.last_mut() else {
+                return;
+            };
+            if frame.0 == frame.1 {
+                let _ = self.frames.pop();
+                continue;
+            }
+            let (origin, base) = (frame.2, frame.3);
+            let item = self.saved[frame.0 as usize];
+            frame.0 += 1;
+            match item {
+                Saved::Event(event) => events.push(relocate(event, origin, base)),
+                Saved::Entry(inner) => next = Some(inner),
+            }
+        }
+    }
+
+    /// Records that `len` events from `start` replay entry `entry`.
+    fn replayed(&mut self, start: usize, len: usize, entry: u32) {
+        if len > 0 {
+            self.replays.push(Replay {
+                start: start as u32,
+                len: len as u32,
+                entry,
+            });
+        }
+    }
+
+    /// Rescues the events of every entry that truncating `events` to `keep`
+    /// would cut off, and forgets the replays it cuts off.
+    ///
+    /// Such entries lie wholly past `keep`: a rewind returns to the start of
+    /// an attempt, and every entry made since began inside that attempt.
+    /// Entries nest like the rules that made them, so the outermost ones are
+    /// rescued as spans and the ones inside become ranges of those spans.
+    fn rescue(&mut self, events: &[Event], keep: usize) {
+        let entries = &self.entries;
+        let split = self.live.partition_point(|&i| {
+            let entry = &entries[i as usize];
+            (entry.from + entry.len) as usize <= keep
+        });
+        let mut doomed = core::mem::take(&mut self.doomed);
+        doomed.clear();
+        doomed.extend(self.live.drain(split..));
+        // Outermost first: by start, and the longer of two that start together.
+        doomed.sort_unstable_by_key(|&i| {
+            let entry = &self.entries[i as usize];
+            (entry.from, u32::MAX - entry.len)
+        });
+        // Tags a boundary as an entry's end rather than its start.
+        const END: u32 = 1 << 31;
+        let mut bounds = core::mem::take(&mut self.bounds);
+        let mut at = 0;
+        while at < doomed.len() {
+            let outer = self.entries[doomed[at] as usize];
+            let (from, end) = (outer.from, outer.from + outer.len);
+            debug_assert!(from as usize >= keep);
+            let mut inner = at + 1;
+            while inner < doomed.len() && self.entries[doomed[inner] as usize].from < end {
+                inner += 1;
+            }
+            // The positions where the span's entries begin and end, to be
+            // translated into item indexes as the span is walked.
+            bounds.clear();
+            for &i in &doomed[at..inner] {
+                let entry = &self.entries[i as usize];
+                bounds.push((entry.from, i));
+                bounds.push((entry.from + entry.len, i | END));
+            }
+            bounds.sort_unstable_by_key(|&(position, _)| position);
+            let mut bound = 0;
+            let mut replay = self.replays.partition_point(|r| r.start < from);
+            let mut position = from;
+            loop {
+                while let Some(&(at_position, tagged)) = bounds.get(bound) {
+                    if at_position > position {
+                        break;
+                    }
+                    // Entries never begin or end inside a replay.
+                    debug_assert_eq!(at_position, position);
+                    let item = self.saved.len() as u32;
+                    let entry = &mut self.entries[(tagged & !END) as usize];
+                    if tagged & END == 0 {
+                        entry.origin = entry.from - from;
+                        entry.from = item;
+                    } else {
+                        entry.len = item - entry.from;
+                        entry.saved = true;
+                    }
+                    bound += 1;
+                }
+                if position >= end {
+                    debug_assert_eq!(position, end, "a replay crosses an entry's end");
+                    break;
+                }
+                match self.replays.get(replay) {
+                    Some(r) if r.start == position => {
+                        self.saved.push(Saved::Entry(r.entry));
+                        position += r.len;
+                        replay += 1;
+                    }
+                    _ => {
+                        let event = relocate(events[position as usize], from, 0);
+                        self.saved.push(Saved::Event(event));
+                        position += 1;
+                    }
+                }
+            }
+            at = inner;
+        }
+        self.doomed = doomed;
+        self.bounds = bounds;
+        let kept = self.replays.partition_point(|r| (r.start as usize) < keep);
+        self.replays.truncate(kept);
     }
 
     fn clear(&mut self) {
@@ -222,7 +413,9 @@ impl Memo {
             self.generation = 1;
         }
         self.entries.clear();
-        self.events.clear();
+        self.saved.clear();
+        self.live.clear();
+        self.replays.clear();
     }
 }
 
@@ -253,7 +446,10 @@ struct Parser<'a> {
     active: Vec<u32>,
     depth: u32,
     too_deep: bool,
-    /// Set once any attempt, strict or not, has hit the depth limit.
+    /// Set once an attempt, strict or not, has hit the depth limit during the
+    /// current outermost speculation. Cleared when an outermost speculation
+    /// begins and when it ends, so a construct nested too deeply limits only
+    /// the speculation it is part of, not every one after it.
     hit_limit: bool,
     /// Counts events that make a strict result depend on more than the rule
     /// and position (the depth limit, the progress guard); such results are
@@ -409,8 +605,8 @@ impl<'a> Parser<'a> {
         if self.strict == 0 || !self.memoize {
             return self.rule_body(r, pos);
         }
-        if let Some(hit) = self.memo.get(r, self.pos) {
-            return self.replay(hit);
+        if let Some((index, hit)) = self.memo.get(r, self.pos) {
+            return self.replay(index, hit);
         }
         let first_event = self.events.len();
         let taint = self.taint;
@@ -444,7 +640,8 @@ impl<'a> Parser<'a> {
         ok
     }
 
-    /// Records a strict attempt's outcome.
+    /// Records a strict attempt's outcome. A success's events stay where
+    /// they are, at the end of the event list, and the entry points at them.
     fn remember(&mut self, rule: u32, pos: u32, first_event: usize, ok: bool, reach: usize) {
         let mut entry = MemoEntry {
             rule,
@@ -453,36 +650,39 @@ impl<'a> Parser<'a> {
             reach: reach as u32,
             from: 0,
             len: 0,
+            origin: 0,
+            saved: true,
         };
         if ok {
             entry.end = self.pos as u32;
-            entry.from = self.memo.events.len() as u32;
-            entry.len = (self.events.len() - first_event) as u32;
-            let base = first_event as u32;
-            self.memo.events.extend(
-                self.events[first_event..]
-                    .iter()
-                    .map(|&event| relocate(event, base, 0)),
-            );
+            let len = self.events.len() - first_event;
+            if len > 0 {
+                entry.from = first_event as u32;
+                entry.len = len as u32;
+                entry.saved = false;
+            }
         }
         self.memo.put(entry, pos as usize, self.kinds.len());
     }
 
     /// Repeats a remembered attempt without parsing it again.
-    fn replay(&mut self, hit: MemoEntry) -> bool {
+    fn replay(&mut self, index: u32, hit: MemoEntry) -> bool {
         self.furthest = self.furthest.max(hit.reach as usize);
         if hit.end == FAILED {
             return false;
         }
-        let base = self.events.len() as u32;
-        let range = hit.from as usize..(hit.from + hit.len) as usize;
-        self.events.extend(
-            self.memo.events[range]
-                .iter()
-                .map(|&event| relocate(event, 0, base)),
-        );
+        let base = self.events.len();
+        self.memo.expand(index, &mut self.events);
+        self.memo.replayed(base, self.events.len() - base, index);
         self.pos = hit.end as usize;
         true
+    }
+
+    /// Truncates the event list to `keep`, first rescuing the events of any
+    /// remembered attempt that would be cut off.
+    fn rewind(&mut self, keep: usize) {
+        self.memo.rescue(&self.events, keep);
+        self.events.truncate(keep);
     }
 
     fn choice(&mut self, alternatives: &[u32]) -> bool {
@@ -501,11 +701,17 @@ impl<'a> Parser<'a> {
     /// is kept.
     #[inline(never)]
     fn speculate(&mut self, alternatives: &[u32]) -> bool {
+        if self.speculating == 0 {
+            // A depth limit hit before this speculation began says nothing
+            // about it: let it try every alternative again.
+            self.hit_limit = false;
+        }
         self.speculating += 1;
         let ok = self.try_alternatives(alternatives);
         self.speculating -= 1;
         if self.speculating == 0 {
             self.memo.clear();
+            self.hit_limit = false;
         }
         ok
     }
@@ -534,12 +740,15 @@ impl<'a> Parser<'a> {
             if best.is_none_or(|(_, r)| reach > r) {
                 best = Some((alt, reach));
             }
-            self.events.truncate(checkpoint.events);
+            self.rewind(checkpoint.events);
             self.pos = checkpoint.pos;
             // Results that hit the depth limit cannot be memoized, so trying
             // every alternative at every level of such input would take
             // exponential time. The input is reported as too deep regardless;
-            // one attempt per decision keeps the rest of the parse linear.
+            // one attempt per decision keeps the rest of this speculation
+            // linear. `speculate` clears the flag when the outermost
+            // speculation ends, so the code after the deep construct is
+            // parsed in full.
             if self.hit_limit {
                 break;
             }
@@ -1355,6 +1564,55 @@ mod tests {
             let lang = soup_language();
             let parse = lang.parse(&src);
             prop_assert_eq!(parse.tree().text(&src), Some(src.as_str()));
+        }
+    }
+
+    /// Nested speculation that rewinds at every level, so the memo rescues
+    /// spans that hold replays of spans it rescued before: memoized parsing
+    /// must still agree with unmemoized parsing exactly, with and without
+    /// errors. (Past the depth limit the two may differ: a rule remembered
+    /// at a shallow depth is replayed where parsing it would hit the limit.
+    /// Such input is reported as nested too deeply either way.)
+    #[test]
+    fn test_memo_rescues_agree_with_unmemoized_parsing() {
+        let lang = speculative_language();
+        let nested = |depth: usize, width: usize, inner: &str, tail: &str| {
+            let mut src = String::new();
+            for _ in 0..depth {
+                src.push_str("{ ");
+                for i in 0..width {
+                    src.push_str(&format!("f(x{i}, {{ y; }}) + -1; z = {{ {i}; }}; "));
+                }
+            }
+            src.push_str(inner);
+            for _ in 0..depth {
+                src.push_str(tail);
+            }
+            src
+        };
+        for (depth, width, inner, tail) in [
+            (1, 1, "x;", " };"),
+            (4, 2, "x = 1;", " };"),
+            (6, 3, "x", " }"),
+            (6, 3, "x = ;", " } = 1;"),
+            (8, 1, "f(", " };"),
+            (10, 1, "x;", " };"),
+        ] {
+            let src = nested(depth, width, inner, tail);
+            let handle = std::thread::Builder::new()
+                .stack_size(8 << 20)
+                .spawn({
+                    let lang = lang.clone();
+                    move || {
+                        let memoized = parse(lang.grammar(), &src);
+                        let plain = parse_unmemoized(lang.grammar(), &src);
+                        assert_eq!(memoized.0, plain.0, "trees differ for {src:?}");
+                        assert_eq!(memoized.1, plain.1, "diagnostics differ for {src:?}");
+                        assert_eq!(memoized.0.text(&src), Some(src.as_str()));
+                    }
+                })
+                .unwrap();
+            handle.join().unwrap();
         }
     }
 

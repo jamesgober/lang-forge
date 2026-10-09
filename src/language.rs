@@ -273,8 +273,11 @@ impl Language {
 
     /// The name of `kind`: the inverse of [`kind`](Self::kind).
     ///
-    /// Returns `"<unknown>"` for a kind this language does not have, which
-    /// can only come from another language.
+    /// A kind is only meaningful to the language that made it. Given a kind
+    /// from another language, `kind_name` cannot tell: it returns whatever
+    /// name this language has at that kind's position in its kind table —
+    /// usually a wrong one — or `"<unknown>"` when this language has fewer
+    /// kinds than that.
     ///
     /// # Examples
     ///
@@ -285,6 +288,13 @@ impl Language {
     /// let parse = lang.parse("go 7");
     /// let names: Vec<&str> = parse.tree().tokens().map(|t| lang.kind_name(*t.kind())).collect();
     /// assert_eq!(names, ["go", "WHITESPACE", "NUMBER"]);
+    ///
+    /// // Another language's kinds get a wrong name, or none.
+    /// let other = Language::from_lsf(
+    ///     "[language]\nname = \"y\"\n[rules]\nlist = \"'[' (pair (',' pair)*)? ']'\"\npair = \"IDENT ':' NUMBER\"\n",
+    /// )?;
+    /// assert_eq!(lang.kind_name(other.kind("[").expect("a symbol")), "go");
+    /// assert_eq!(lang.kind_name(other.kind("pair").expect("a rule")), "<unknown>");
     /// # Ok::<(), lang_forge::Error>(())
     /// ```
     #[must_use]

@@ -13,37 +13,75 @@
 //! remember that their offsets no longer map one-to-one onto the source.
 //!
 //! Inline tables may span lines and arrays and inline tables may end with a
-//! trailing comma, as NOML allows; everything else follows TOML.
+//! trailing comma, as NOML allows; everything else follows TOML, including
+//! its rules for what is invalid: a table defined by dotted keys cannot be
+//! defined again by a `[header]`, keys cannot be multi-line strings, and a
+//! number, date, or time must be well formed even though no schematic
+//! setting takes one. A leading byte-order mark is skipped.
 
-use alloc::{borrow::Cow, format, string::String, vec::Vec};
+use alloc::{borrow::Cow, collections::BTreeMap, format, string::String, vec::Vec};
 
 use diag_lang::{Diagnostic, Label, Severity};
 use syntax_lang::Span;
 
-/// How deeply arrays and inline tables may nest. Real schematics nest two or
-/// three levels; the limit keeps hostile input from exhausting the stack.
+/// How deeply a schematic may nest, counting every level together: each part
+/// of a `[header]` or dotted key, each array, and each inline table. Real
+/// schematics nest four or five levels (`[rules.expr]`, `levels`, a level
+/// table, its operator array), and nothing deeper than that can be a valid
+/// schematic; the limit keeps hostile input from exhausting the stack, both
+/// while reading and when the document is dropped.
 const MAX_NESTING: u32 = 64;
+
+/// The largest schematic accepted, in bytes. Real schematics are a few
+/// kilobytes; machine-generated ones with tens of thousands of literals are
+/// well under a megabyte. The limit bounds everything forging does in
+/// proportion to the input (a worst-case schematic of this size needs about
+/// 150 MB before its tables are even sized).
+pub(crate) const MAX_SCHEMATIC: usize = 8 << 20;
 
 /// A table: its entries in source order.
 #[derive(Debug)]
 pub(crate) struct Table<'s> {
     pub(crate) entries: Vec<Entry<'s>>,
+    /// Entry indexes by key. Every insertion checks its key for a duplicate,
+    /// so a scan of `entries` there made reading a table quadratic.
+    index: BTreeMap<Cow<'s, str>, usize>,
     /// The table header or inline table, or the key that implied the table.
     pub(crate) span: Span,
     /// Defined by a `[header]` (so a second header is a duplicate).
     explicit: bool,
     /// An inline table, which is complete as written and cannot be extended.
     sealed: bool,
+    /// Defined by a dotted key (`a.b = 1` defines `a`), so a `[header]` may
+    /// not define it again.
+    dotted: bool,
 }
 
 impl Default for Table<'_> {
     fn default() -> Self {
         Self {
             entries: Vec::new(),
+            index: BTreeMap::new(),
             span: Span::empty(0),
             explicit: false,
             sealed: false,
+            dotted: false,
         }
+    }
+}
+
+impl<'s> Table<'s> {
+    /// The index of the entry called `key`.
+    fn find(&self, key: &str) -> Option<usize> {
+        self.index.get(key).copied()
+    }
+
+    /// Appends `entry`, whose key must be new; returns its index.
+    fn push(&mut self, entry: Entry<'s>) -> usize {
+        let at = self.entries.len();
+        let _ = self.index.insert(entry.key.clone(), at);
+        self.entries.push(entry);
+        at
     }
 }
 
@@ -67,9 +105,11 @@ pub(crate) struct Value<'s> {
 pub(crate) enum ValueKind<'s> {
     Str(Text<'s>),
     Bool(bool),
-    /// A number, kept as written: no schematic setting takes one, so it is only
-    /// ever reported as the wrong type.
+    /// A number, checked but not kept: no schematic setting takes one, so it
+    /// is only ever reported as the wrong type.
     Number,
+    /// A TOML date, time, or date-time; like a number, never a valid setting.
+    DateTime,
     Array(Vec<Value<'s>>),
     Table(Table<'s>),
 }
@@ -111,6 +151,7 @@ impl ValueKind<'_> {
             ValueKind::Str(_) => "a string",
             ValueKind::Bool(_) => "a boolean",
             ValueKind::Number => "a number",
+            ValueKind::DateTime => "a date or time",
             ValueKind::Array(_) => "an array",
             ValueKind::Table(_) => "a table",
         }
@@ -119,13 +160,18 @@ impl ValueKind<'_> {
 
 /// Reads a schematic into its root table.
 pub(crate) fn read(text: &str) -> Result<Table<'_>, Diagnostic> {
-    if u32::try_from(text.len()).is_err() {
-        return Err(error(Span::empty(0), "the schematic is larger than 4 GiB"));
+    if text.len() > MAX_SCHEMATIC {
+        return Err(error(
+            Span::empty(0),
+            format!("the schematic is larger than {} MiB", MAX_SCHEMATIC >> 20),
+        ));
     }
     let mut reader = Reader {
         src: text,
         bytes: text.as_bytes(),
-        pos: 0,
+        // A byte-order mark is an encoding signature, not content. Spans stay
+        // offsets into `text`, mark included.
+        pos: if text.starts_with('\u{FEFF}') { 3 } else { 0 },
         depth: 0,
     };
     reader.document()
@@ -139,6 +185,9 @@ struct Reader<'s> {
     src: &'s str,
     bytes: &'s [u8],
     pos: usize,
+    /// The nesting level of the table or array being read: the number of
+    /// header parts, dotted-key parts, arrays, and inline tables around the
+    /// current position. Never more than `MAX_NESTING`.
     depth: u32,
 }
 
@@ -160,7 +209,11 @@ impl<'s> Reader<'s> {
             self.skip_blank_lines();
             match self.peek() {
                 None => return Ok(root),
-                Some(b'[') => current = self.header(&mut root)?,
+                Some(b'[') => {
+                    current = self.header(&mut root)?;
+                    // A header has at most `MAX_NESTING` parts.
+                    self.depth = current.len() as u32;
+                }
                 Some(_) => {
                     let (keys, value) = self.key_value()?;
                     insert_at(&mut root, &current, keys, value)?;
@@ -195,22 +248,19 @@ impl<'s> Reader<'s> {
         let mut table = root;
         for (i, (key, key_span)) in keys.into_iter().enumerate() {
             let last = i + 1 == count;
-            let index = match table.entries.iter().position(|e| e.key == key) {
+            let index = match table.find(&key) {
                 Some(index) => index,
-                None => {
-                    table.entries.push(Entry {
-                        key,
-                        key_span,
-                        value: Value {
-                            kind: ValueKind::Table(Table {
-                                span,
-                                ..Table::default()
-                            }),
+                None => table.push(Entry {
+                    key,
+                    key_span,
+                    value: Value {
+                        kind: ValueKind::Table(Table {
                             span,
-                        },
-                    });
-                    table.entries.len() - 1
-                }
+                            ..Table::default()
+                        }),
+                        span,
+                    },
+                }),
             };
             let entry = &mut table.entries[index];
             let ValueKind::Table(child) = &mut entry.value.kind else {
@@ -226,13 +276,16 @@ impl<'s> Reader<'s> {
                 ));
             }
             if last {
+                let name = self.src[open + 1..span.end().to_usize() - 1].trim();
                 if child.explicit {
+                    return Err(error(span, format!("table [{name}] is defined twice")));
+                }
+                // TOML: dotted keys define their tables; a header may add
+                // sub-tables to one, but not define it again.
+                if child.dotted {
                     return Err(error(
                         span,
-                        format!(
-                            "table [{}] is defined twice",
-                            self.src[open + 1..span.end().to_usize() - 1].trim()
-                        ),
+                        format!("table [{name}] is already defined by dotted keys"),
                     ));
                 }
                 child.explicit = true;
@@ -247,14 +300,25 @@ impl<'s> Reader<'s> {
     /// `a.b = value`.
     fn key_value(&mut self) -> Result<(Keys<'s>, Value<'s>)> {
         let keys = self.key_path()?;
+        // Every part but the last opens a table one level deeper, and the
+        // value, if it is an array or inline table, is one level below that:
+        // the levels add up with those around the key, not each on its own.
+        let outer = self.depth;
+        let inner = outer + keys.len() as u32 - 1;
+        if inner > MAX_NESTING {
+            let (_, last) = keys[keys.len() - 1];
+            return Err(too_deep(last));
+        }
         self.skip_spaces();
         if self.peek() != Some(b'=') {
             return Err(self.unexpected("`=` after the key"));
         }
         self.pos += 1;
         self.skip_spaces();
-        let value = self.value()?;
-        Ok((keys, value))
+        self.depth = inner;
+        let value = self.value();
+        self.depth = outer;
+        Ok((keys, value?))
     }
 
     /// One or more keys joined by dots.
@@ -285,7 +349,13 @@ impl<'s> Reader<'s> {
     fn key(&mut self) -> Result<(Cow<'s, str>, Span)> {
         let start = self.pos;
         match self.peek() {
-            Some(b'"' | b'\'') => {
+            Some(quote @ (b'"' | b'\'')) => {
+                if self.bytes[start..].starts_with(&[quote; 3]) {
+                    return Err(error(
+                        Span::new(start as u32, start as u32 + 3),
+                        "a key cannot be a multi-line string",
+                    ));
+                }
                 let text = self.string()?;
                 Ok((text.text, self.span_from(start)))
             }
@@ -314,14 +384,7 @@ impl<'s> Reader<'s> {
                     "NOML native types (`@...`) are not allowed in a schematic",
                 ));
             }
-            Some(b'0'..=b'9' | b'+' | b'-') => {
-                while self.peek().is_some_and(|b| {
-                    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-')
-                }) {
-                    self.pos += 1;
-                }
-                ValueKind::Number
-            }
+            Some(b'0'..=b'9' | b'+' | b'-') => self.number()?,
             Some(b) if b.is_ascii_alphabetic() => {
                 let span = self.word_span();
                 let word = &self.src[span.start().to_usize()..span.end().to_usize()];
@@ -329,6 +392,7 @@ impl<'s> Reader<'s> {
                 match word {
                     "true" => ValueKind::Bool(true),
                     "false" => ValueKind::Bool(false),
+                    "inf" | "nan" => ValueKind::Number,
                     _ if self.peek() == Some(b'(') => {
                         return Err(Diagnostic::new(
                             Severity::Error,
@@ -350,13 +414,58 @@ impl<'s> Reader<'s> {
         })
     }
 
+    /// A number, date, or time, checked against TOML's forms: decimal
+    /// integers and floats with `_` only between digits and no leading
+    /// zeros; `0x`, `0o`, and `0b` integers; `inf` and `nan` with a sign;
+    /// and RFC 3339 dates, times, and date-times (the time may follow the
+    /// date after a space). Anything else — `1abc`, a lone `-`, `1__0`,
+    /// `0123` — is refused rather than accepted as some number.
+    fn number(&mut self) -> Result<ValueKind<'s>> {
+        let start = self.pos;
+        let scan = |bytes: &[u8], mut at: usize| {
+            while bytes.get(at).is_some_and(|&b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-' | b':')
+            }) {
+                at += 1;
+            }
+            at
+        };
+        let mut end = scan(self.bytes, start);
+        // `1979-05-27 07:32:00`: TOML lets a space stand for the `T`.
+        if is_date(&self.src[start..end])
+            && self.bytes.get(end) == Some(&b' ')
+            && self.bytes.get(end + 1).is_some_and(u8::is_ascii_digit)
+            && self.bytes.get(end + 2).is_some_and(u8::is_ascii_digit)
+            && self.bytes.get(end + 3) == Some(&b':')
+        {
+            end = scan(self.bytes, end + 1);
+        }
+        self.pos = end;
+        let text = &self.src[start..end];
+        if is_number(text) {
+            return Ok(ValueKind::Number);
+        }
+        if is_date_time(text) {
+            return Ok(ValueKind::DateTime);
+        }
+        // Shaped like a date (`YYYY-MM-...`) or a time: say which was meant.
+        let b = text.as_bytes();
+        let date_shaped = b.len() >= 8 && b[4] == b'-' && b[..4].iter().all(u8::is_ascii_digit);
+        let what = if text.contains(':') || date_shaped {
+            "date or time"
+        } else {
+            "number"
+        };
+        Err(error(
+            self.span_from(start),
+            format!("invalid {what} `{text}`"),
+        ))
+    }
+
     /// Runs `parse` one nesting level deeper, refusing to go past the limit.
     fn nested<T>(&mut self, parse: fn(&mut Self) -> Result<T>) -> Result<T> {
         if self.depth >= MAX_NESTING {
-            return Err(error(
-                Span::new(self.pos as u32, self.pos as u32 + 1),
-                format!("arrays and inline tables nest more than {MAX_NESTING} levels deep"),
-            ));
+            return Err(too_deep(Span::new(self.pos as u32, self.pos as u32 + 1)));
         }
         self.depth += 1;
         let result = parse(self);
@@ -650,6 +759,145 @@ fn is_bare_key(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
 }
 
+fn too_deep(span: Span) -> Diagnostic {
+    error(
+        span,
+        format!("the schematic nests more than {MAX_NESTING} levels deep"),
+    )
+}
+
+/// Whether `text` is one or more digits of `radix`, with each `_` between
+/// two digits.
+fn is_digits(text: &str, radix: u32) -> bool {
+    let bytes = text.as_bytes();
+    !bytes.is_empty()
+        && bytes.iter().enumerate().all(|(i, &b)| {
+            if b == b'_' {
+                // Neither first nor last, and between two digits.
+                i > 0 && i + 1 < bytes.len() && bytes[i - 1] != b'_' && bytes[i + 1] != b'_'
+            } else {
+                char::from(b).is_digit(radix)
+            }
+        })
+}
+
+/// Whether `text` is a TOML integer or float.
+fn is_number(text: &str) -> bool {
+    let unsigned = text.strip_prefix(['+', '-']);
+    let body = unsigned.unwrap_or(text);
+    if matches!(body, "inf" | "nan") {
+        return true;
+    }
+    // Radix prefixes take no sign.
+    for (prefix, radix) in [("0x", 16), ("0o", 8), ("0b", 2)] {
+        if let Some(digits) = body.strip_prefix(prefix) {
+            return unsigned.is_none() && is_digits(digits, radix);
+        }
+    }
+    let (mantissa, exponent) = match body.find(['e', 'E']) {
+        Some(at) => (&body[..at], Some(&body[at + 1..])),
+        None => (body, None),
+    };
+    let (int, fraction) = match mantissa.split_once('.') {
+        Some((int, fraction)) => (int, Some(fraction)),
+        None => (mantissa, None),
+    };
+    // The integer part has no leading zeros; the exponent may.
+    is_digits(int, 10)
+        && (int == "0" || !int.starts_with('0'))
+        && fraction.is_none_or(|f| is_digits(f, 10))
+        && exponent.is_none_or(|e| is_digits(e.strip_prefix(['+', '-']).unwrap_or(e), 10))
+}
+
+/// Whether `text` is a TOML local date, `YYYY-MM-DD`, of a real day.
+fn is_date(text: &str) -> bool {
+    let b = text.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    let (Some(year), Some(month), Some(day)) =
+        (number_at(b, 0, 4), number_at(b, 5, 2), number_at(b, 8, 2))
+    else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        1..=12 => 31,
+        _ => return false,
+    };
+    (1..=days).contains(&day)
+}
+
+/// Whether `text` is a TOML time (`HH:MM`, with optional `:SS` and
+/// fraction), optionally followed by a UTC offset when `offset` allows one.
+fn is_time(text: &str, offset: bool) -> bool {
+    let b = text.as_bytes();
+    let (Some(hour), Some(minute)) = (number_at(b, 0, 2), number_at(b, 3, 2)) else {
+        return false;
+    };
+    if b.len() < 5 || b[2] != b':' || hour > 23 || minute > 59 {
+        return false;
+    }
+    let mut at = 5;
+    if b.get(at) == Some(&b':') {
+        match number_at(b, at + 1, 2) {
+            // 60 is a leap second.
+            Some(second) if second <= 60 => at += 3,
+            _ => return false,
+        }
+        if b.get(at) == Some(&b'.') {
+            let digits = b[at + 1..]
+                .iter()
+                .take_while(|c| c.is_ascii_digit())
+                .count();
+            if digits == 0 {
+                return false;
+            }
+            at += 1 + digits;
+        }
+    }
+    let rest = &text[at..];
+    if rest.is_empty() {
+        return true;
+    }
+    if !offset {
+        return false;
+    }
+    if matches!(rest, "Z" | "z") {
+        return true;
+    }
+    let o = rest.as_bytes();
+    o.len() == 6
+        && matches!(o[0], b'+' | b'-')
+        && o[3] == b':'
+        && number_at(o, 1, 2).is_some_and(|h| h <= 23)
+        && number_at(o, 4, 2).is_some_and(|m| m <= 59)
+}
+
+/// Whether `text` is a TOML date, time, or date-time (`T`, `t`, or a space
+/// between the date and the time).
+fn is_date_time(text: &str) -> bool {
+    if is_date(text) {
+        return true;
+    }
+    if text.len() > 11 && is_date(&text[..10]) && matches!(text.as_bytes()[10], b'T' | b't' | b' ')
+    {
+        return is_time(&text[11..], true);
+    }
+    is_time(text, false)
+}
+
+/// The decimal number in `b[at..at + len]`, if those are all digits.
+fn number_at(b: &[u8], at: usize, len: usize) -> Option<u32> {
+    let digits = b.get(at..at + len)?;
+    digits.iter().try_fold(0u32, |n, &d| {
+        d.is_ascii_digit().then(|| n * 10 + u32::from(d - b'0'))
+    })
+}
+
 /// Inserts `value` at the dotted `keys` below the table `path` leads to.
 fn insert_at<'s>(
     table: &mut Table<'s>,
@@ -672,7 +920,7 @@ fn insert<'s>(table: &mut Table<'s>, keys: Keys<'s>, value: Value<'s>) -> Result
     let mut table = table;
     let count = keys.len();
     for (i, (key, key_span)) in keys.into_iter().enumerate() {
-        let existing = table.entries.iter().position(|e| e.key == key);
+        let existing = table.find(&key);
         if i + 1 == count {
             if let Some(index) = existing {
                 let first = table.entries[index].key_span;
@@ -683,7 +931,7 @@ fn insert<'s>(table: &mut Table<'s>, keys: Keys<'s>, value: Value<'s>) -> Result
                 )
                 .with_secondary(Label::new(first, "first defined here")));
             }
-            table.entries.push(Entry {
+            let _ = table.push(Entry {
                 key,
                 key_span,
                 value,
@@ -692,24 +940,24 @@ fn insert<'s>(table: &mut Table<'s>, keys: Keys<'s>, value: Value<'s>) -> Result
         }
         let index = match existing {
             Some(index) => index,
-            None => {
-                table.entries.push(Entry {
-                    key,
-                    key_span,
-                    value: Value {
-                        kind: ValueKind::Table(Table {
-                            span: key_span,
-                            ..Table::default()
-                        }),
+            None => table.push(Entry {
+                key,
+                key_span,
+                value: Value {
+                    kind: ValueKind::Table(Table {
                         span: key_span,
-                    },
-                });
-                table.entries.len() - 1
-            }
+                        ..Table::default()
+                    }),
+                    span: key_span,
+                },
+            }),
         };
         let entry = &mut table.entries[index];
         match &mut entry.value.kind {
-            ValueKind::Table(child) if !child.sealed && !child.explicit => table = child,
+            ValueKind::Table(child) if !child.sealed && !child.explicit => {
+                child.dotted = true;
+                table = child;
+            }
             _ => {
                 return Err(error(
                     key_span,
@@ -920,9 +1168,231 @@ mod tests {
     #[test]
     fn test_read_limits_nesting() {
         let deep = format!("a = {}{}\n", "[".repeat(100), "]".repeat(100));
-        assert!(message(&deep).contains("nest more than 64 levels"));
+        assert_eq!(
+            message(&deep),
+            "the schematic nests more than 64 levels deep"
+        );
         let ok = format!("a = {}{}\n", "[".repeat(60), "]".repeat(60));
         assert!(read(&ok).is_ok());
+        let ok = format!("a = {}{}\n", "[".repeat(64), "]".repeat(64));
+        assert!(read(&ok).is_ok());
+    }
+
+    #[test]
+    fn test_read_limits_total_nesting_across_keys_and_values() {
+        // Each limit on its own allowed 64 levels; together they nested
+        // 64 inline tables of 64-part dotted keys, a 4096-deep table tree.
+        let key = ["k"; 64].join(".");
+        let mut bomb = String::from("1");
+        for _ in 0..64 {
+            bomb = format!("{{ {key} = {bomb} }}");
+        }
+        assert_eq!(
+            message(&format!("a = {bomb}\n")),
+            "the schematic nests more than 64 levels deep"
+        );
+        // Header parts, dotted parts, and values add up.
+        let half = ["k"; 32].join(".");
+        assert!(read(&format!("[{half}]\n{half} = 1\n")).is_ok());
+        assert!(read(&format!("[{half}]\n{half}.x = 1\n")).is_ok());
+        assert_eq!(
+            message(&format!("[{half}]\n{half}.x.y = 1\n")),
+            "the schematic nests more than 64 levels deep"
+        );
+        assert!(
+            read(&format!(
+                "[{half}]\nx = {}{}\n",
+                "[".repeat(32),
+                "]".repeat(32)
+            ))
+            .is_ok()
+        );
+        assert_eq!(
+            message(&format!(
+                "[{half}]\nx = {}{}\n",
+                "[".repeat(33),
+                "]".repeat(33)
+            )),
+            "the schematic nests more than 64 levels deep"
+        );
+        let inline = format!("x = {}1{}\n", "{ y = ".repeat(40), " }".repeat(40));
+        assert!(read(&format!("[{half}]\n{inline}")).is_err());
+        assert!(read(&inline).is_ok());
+    }
+
+    #[test]
+    fn test_read_skips_a_leading_byte_order_mark() {
+        let text = "\u{FEFF}[language]\nname = \"x\"\n";
+        let doc = read(text).unwrap();
+        let language = table_of(&doc, "language");
+        assert_eq!(str_of(language, "name"), "x");
+        // Spans stay offsets into the text, mark included.
+        assert_eq!(doc.entries[0].key_span, Span::new(4, 12));
+        // Anywhere else it is not whitespace.
+        assert!(read("a = 1\n\u{FEFF}b = 2\n").is_err());
+    }
+
+    #[test]
+    fn test_read_rejects_header_redefining_a_dotted_table() {
+        assert_eq!(
+            message("a.b.c = 1\n[a.b]\n"),
+            "table [a.b] is already defined by dotted keys"
+        );
+        assert_eq!(
+            message("a.b = 1\n[a]\n"),
+            "table [a] is already defined by dotted keys"
+        );
+        assert_eq!(
+            message("[t]\nx.y = 1\n[t.x]\n"),
+            "table [t.x] is already defined by dotted keys"
+        );
+        // A header may still add a sub-table to one (TOML allows it).
+        let doc = read("[f]\napple.color = \"red\"\n[f.apple.texture]\nsmooth = true\n").unwrap();
+        let apple = table_of(table_of(&doc, "f"), "apple");
+        assert!(matches!(
+            table_of(apple, "texture").entries[0].value.kind,
+            ValueKind::Bool(true)
+        ));
+        // And a header-implied table may be defined later.
+        assert!(read("[a.b.c]\n[a]\nx = 1\n").is_ok());
+    }
+
+    #[test]
+    fn test_read_rejects_multiline_string_keys() {
+        assert_eq!(
+            message("\"\"\"k\"\"\" = 1\n"),
+            "a key cannot be a multi-line string"
+        );
+        assert_eq!(
+            message("'''k''' = 1\n"),
+            "a key cannot be a multi-line string"
+        );
+        assert_eq!(
+            message("[\"\"\"t\"\"\"]\n"),
+            "a key cannot be a multi-line string"
+        );
+        let doc = read("\"\" = 'x'\n'q' . 'b' = 'y'\n").unwrap();
+        assert_eq!(str_of(&doc, ""), "x");
+    }
+
+    #[test]
+    fn test_read_accepts_every_toml_number_date_and_time() {
+        let numbers = [
+            "0",
+            "+99",
+            "-17",
+            "1_000",
+            "5_349_221",
+            "0xDEADBEEF",
+            "0xdead_beef",
+            "0o755",
+            "0b1101_0110",
+            "+1.0",
+            "3.1415",
+            "-0.01",
+            "5e+22",
+            "1e06",
+            "-2E-2",
+            "6.626e-34",
+            "224_617.445_991",
+            "inf",
+            "+inf",
+            "-inf",
+            "nan",
+            "+nan",
+            "-nan",
+            "-0",
+            "0.0",
+        ];
+        for n in numbers {
+            let text = format!("a = {n}\n");
+            let doc = read(&text).unwrap_or_else(|e| panic!("{n}: {e:?}"));
+            assert!(
+                matches!(doc.entries[0].value.kind, ValueKind::Number),
+                "{n}"
+            );
+        }
+        let dates = [
+            "1979-05-27T07:32:00Z",
+            "1979-05-27T00:32:00-07:00",
+            "1979-05-27T00:32:00.999999+07:00",
+            "1979-05-27 07:32:00Z",
+            "1979-05-27t07:32:00",
+            "1979-05-27T07:32",
+            "1979-05-27",
+            "2024-02-29",
+            "07:32:00",
+            "00:32:00.999999",
+            "07:32",
+            "23:59:60",
+        ];
+        for d in dates {
+            let text = format!("a = {d}\n");
+            let doc = read(&text).unwrap_or_else(|e| panic!("{d}: {e:?}"));
+            assert!(
+                matches!(doc.entries[0].value.kind, ValueKind::DateTime),
+                "{d}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_rejects_malformed_numbers_dates_and_times() {
+        for n in [
+            "1abc", "-", "+", "1__0", "1_", "0123", "+0x1", "0X1F", "0xG", "0x", "0b2", "1.",
+            "+.5", "1e", "1e+", "1.e5", "1_.5", "1.5_", "--1", "1-2", "0x_1", "1e5.5", "-0b1",
+        ] {
+            assert_eq!(
+                message(&format!("a = {n}\n")),
+                format!("invalid number `{n}`"),
+                "{n}"
+            );
+        }
+        for d in [
+            "1979-13-01",
+            "2023-02-29",
+            "1979-05-32",
+            "24:00:00",
+            "07:60",
+            "07:32:61",
+            "07:32:00Z",
+            "1979-05-27T07",
+            "1979-05-27T07:32:00+7:00",
+            "1979-05-27T07:32:00.Z",
+            "1979-05-27X07:32",
+        ] {
+            assert_eq!(
+                message(&format!("a = {d}\n")),
+                format!("invalid date or time `{d}`"),
+                "{d}"
+            );
+        }
+        // The error spans the whole malformed value.
+        let err = read("a = 12ab\n").unwrap_err();
+        assert_eq!(err.primary().span(), Span::new(4, 8));
+    }
+
+    #[test]
+    fn test_read_duplicate_checks_scale_linearly() {
+        // 200,000 keys in one table, and 200,000 distinct dotted paths: a
+        // scan for each key made this take minutes.
+        let mut text = String::from("[t]\n");
+        for i in 0..200_000 {
+            text.push_str(&format!("k{i} = 1\n"));
+        }
+        for i in 0..200_000 {
+            text.push_str(&format!("d.p{i} = 1\n"));
+        }
+        let started = std::time::Instant::now();
+        let doc = read(&text).unwrap();
+        assert_eq!(table_of(&doc, "t").entries.len(), 200_001);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        text.push_str("k77777 = 2\n");
+        assert_eq!(message(&text), "`k77777` is defined twice");
     }
 
     #[test]

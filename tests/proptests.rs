@@ -175,6 +175,66 @@ proptest! {
         prop_assert_eq!(at, src.len());
     }
 
+    /// A leading byte-order mark is trivia: the parse of the marked source
+    /// is the parse of the unmarked one, three bytes along.
+    #[test]
+    fn prop_leading_byte_order_mark_changes_only_offsets(src in "\\PC{0,64}", which in 0..SCHEMATICS.len()) {
+        let lang = Language::from_lsf(SCHEMATICS[which]).expect("example schematics forge");
+        let marked = format!("\u{FEFF}{src}");
+        let plain = lang.parse(&src);
+        let parse = lang.parse(&marked);
+        prop_assert_eq!(parse.tree().text(&marked), Some(marked.as_str()));
+        assert_well_nested(parse.tree())?;
+        let first = lang.lex(&marked)[0];
+        prop_assert!(first.is_trivia());
+        prop_assert_eq!(first.span().start().to_usize(), 0);
+        let shifted = |d: &lang_forge::diag_lang::Diagnostic| {
+            let span = d.primary().span();
+            (d.message().to_owned(), span.start().to_usize() + 3, span.end().to_usize() + 3)
+        };
+        let expected: Vec<_> = plain.diagnostics().iter().map(shifted).collect();
+        let found: Vec<_> = parse
+            .diagnostics()
+            .iter()
+            .map(|d| {
+                let span = d.primary().span();
+                (d.message().to_owned(), span.start().to_usize(), span.end().to_usize())
+            })
+            .collect();
+        prop_assert_eq!(found, expected);
+    }
+
+    /// The same holds for a schematic: a mark changes nothing but offsets.
+    #[test]
+    fn prop_schematic_byte_order_mark_changes_only_offsets(which in 0..SCHEMATICS.len(), cut in any::<prop::sample::Index>()) {
+        // Whole schematics, and truncated ones that fail somewhere.
+        let full = SCHEMATICS[which];
+        let mut at = cut.index(full.len() + 1);
+        while !full.is_char_boundary(at) {
+            at -= 1;
+        }
+        let text = &full[..at];
+        let marked = format!("\u{FEFF}{text}");
+        // Problems of the whole document sit at offset 0 either way; every
+        // other one moves along by the mark's three bytes.
+        let located = |r: Result<Language, lang_forge::Error>, shift: usize| match r {
+            Ok(lang) => Ok(lang.name().to_owned()),
+            Err(e) => Err(e
+                .diagnostics()
+                .iter()
+                .map(|d| {
+                    let start = d.primary().span().start().to_usize();
+                    let start = if start == 0 && d.primary().span().is_empty() { 0 } else { start + shift };
+                    (d.message().to_owned(), start)
+                })
+                .collect::<Vec<_>>()),
+        };
+        prop_assert_eq!(
+            located(Language::from_lsf(&marked), 0),
+            located(Language::from_lsf(text), 3)
+        );
+    }
+
     #[test]
     fn prop_forge_never_panics_on_arbitrary_text(text in "\\PC{0,200}") {
         let _ = Language::from_lsf(&text);

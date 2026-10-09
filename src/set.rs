@@ -31,6 +31,16 @@ impl Sets {
         }
     }
 
+    /// The bytes `count` more sets would take.
+    pub(crate) fn bytes_for(&self, count: usize) -> usize {
+        count.saturating_mul(self.width).saturating_mul(8)
+    }
+
+    /// The bytes the sets allocated so far take.
+    pub(crate) fn bytes(&self) -> usize {
+        self.words.len().saturating_mul(8)
+    }
+
     /// Adds an empty set and returns its identifier.
     pub(crate) fn alloc(&mut self) -> SetId {
         let id = self.words.len() / self.width;
@@ -92,6 +102,11 @@ impl Sets {
     /// in the arena.
     pub(crate) fn scratch(&self) -> Vec<u64> {
         alloc::vec![0; self.width]
+    }
+
+    /// Empties the scratch row `buf`.
+    pub(crate) fn clear_scratch(buf: &mut [u64]) {
+        buf.iter_mut().for_each(|w| *w = 0);
     }
 
     /// Adds every member of set `id` to the scratch row `buf`.
