@@ -8,7 +8,7 @@ use pass_lang::{Outcome, Pass, PassError, PassManager};
 use syntax_lang::{Node, Span, Token};
 
 use crate::{
-    Error, Parse, codes,
+    Error, Parse, ParseBudget, codes,
     error::Report,
     grammar::{self, Grammar, Lex},
     kind::Kind,
@@ -112,6 +112,8 @@ pub type Capability = Box<dyn for<'a> Pass<Parse<'a>>>;
 #[derive(Clone, Debug)]
 pub struct Language {
     grammar: Grammar,
+    /// Not part of the tables: a setting of this value, never in an image.
+    budget: ParseBudget,
 }
 
 impl Language {
@@ -233,7 +235,7 @@ impl Language {
                     };
                     extra.warnings = warnings.into();
                 }
-                Ok(Self { grammar })
+                Ok(Self::from_grammar(grammar))
             }
             _ => {
                 if report.is_clean() {
@@ -250,7 +252,10 @@ impl Language {
 
     /// Wraps compiled tables (the language image).
     pub(crate) fn from_grammar(grammar: Grammar) -> Self {
-        Self { grammar }
+        Self {
+            grammar,
+            budget: ParseBudget::DEFAULT,
+        }
     }
 
     /// The compiled tables, for the image writer.
@@ -787,11 +792,19 @@ impl Language {
     ///
     /// Never fails: problems become diagnostics on the returned [`Parse`] and
     /// the tree is complete regardless, with unexpected tokens wrapped in
-    /// `ERROR` nodes. Input nested too deeply to parse is reported rather
-    /// than followed: the parser recurses at most 768 grammar levels, which
-    /// needs at most about 256 KiB of stack in a release build (768 KiB in a
-    /// debug build) and allows well over a hundred levels of nesting in
-    /// typical grammars.
+    /// `ERROR` nodes.
+    ///
+    /// Two limits stop a parse where it is, in time linear in the input: the
+    /// depth limit and the step budget. The parser recurses at most 768
+    /// grammar levels, which needs at most about 256 KiB of stack in a
+    /// release build (768 KiB in a debug build) and allows well over a
+    /// hundred levels of nesting in typical grammars; input that needs more,
+    /// even in an alternative the parser only tries, stops the parse with
+    /// one `LF1003` diagnostic at the token where the limit was reached. The
+    /// [budget](Self::with_parse_budget) stops it with `LF9002`. Either way
+    /// the tree keeps what was parsed, and the tokens not yet parsed go into
+    /// one `ERROR` node, so it stays lossless; nothing after the stop is
+    /// parsed or reported.
     ///
     /// # Examples
     ///
@@ -815,8 +828,59 @@ impl Language {
     /// ```
     #[must_use]
     pub fn parse<'a>(&'a self, source: &'a str) -> Parse<'a> {
-        let (tree, diagnostics) = parser::parse(&self.grammar, source);
-        crate::inject::finish(self, source, tree, diagnostics)
+        let parsed = parser::parse(&self.grammar, source, self.budget);
+        crate::inject::finish(self, source, parsed)
+    }
+
+    /// The language with every later parse held to `budget`, which caps the
+    /// parser's steps in proportion to the input (see [`ParseBudget`]). A
+    /// language starts with [`ParseBudget::DEFAULT`], which ordinary input
+    /// never reaches; a tool running sketches it did not write can set a
+    /// tighter one to bound how long a hostile grammar can keep it busy.
+    ///
+    /// The budget is a setting of this value, not part of the language: it
+    /// is not stored in an [image](Self::to_image), and a loaded or newly
+    /// forged language starts with the default.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lang_forge::{Language, ParseBudget};
+    ///
+    /// let lang = Language::from_lsf("[language]\nname = \"n\"\n[rules]\nfile = \"item*\"\nitem = \"NUMBER\"\n")?;
+    /// assert_eq!(lang.parse_budget(), ParseBudget::DEFAULT);
+    ///
+    /// // At most 100 steps, however long the input.
+    /// let strict = lang.with_parse_budget(ParseBudget::new(100, 0));
+    /// assert!(!strict.parse(&"1 ".repeat(40)).has_errors());
+    /// let source = "1 ".repeat(500);
+    /// let stopped = strict.parse(&source);
+    /// assert_eq!(stopped.diagnostics().len(), 1);
+    /// assert_eq!(stopped.steps(), 100);
+    /// # Ok::<(), lang_forge::Error>(())
+    /// ```
+    #[must_use]
+    pub fn with_parse_budget(mut self, budget: ParseBudget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// The budget every parse of this language is held to; see
+    /// [`with_parse_budget`](Self::with_parse_budget).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lang_forge::{Language, ParseBudget};
+    ///
+    /// let lang = Language::from_lsf("[language]\nname = \"n\"\n[rules]\nn = \"NUMBER\"\n")?
+    ///     .with_parse_budget(ParseBudget::new(5_000, 64));
+    /// assert_eq!(lang.parse_budget().per_token(), 64);
+    /// # Ok::<(), lang_forge::Error>(())
+    /// ```
+    #[must_use]
+    pub fn parse_budget(&self) -> ParseBudget {
+        self.budget
     }
 
     /// Parses `source` as a file with `extension`: with the lexer mode and
@@ -858,9 +922,15 @@ impl Language {
         } else {
             start
         };
-        let (tree, diagnostics) =
-            parser::parse_tokens(&self.grammar, source, &tokens, start, diagnostics);
-        crate::inject::finish(self, source, tree, diagnostics)
+        let parsed = parser::parse_tokens(
+            &self.grammar,
+            source,
+            &tokens,
+            start,
+            diagnostics,
+            self.budget,
+        );
+        crate::inject::finish(self, source, parsed)
     }
 
     /// Assembles the language's capability pipeline from a registry of passes.

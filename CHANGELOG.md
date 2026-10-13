@@ -13,6 +13,110 @@
 
 ---
 
+## [2.0.0-alpha.2] - 2026-10-13
+
+A security fix: past the parser's depth limit, parsing time grew
+exponentially with every level of nesting, a denial of service in any editor
+or service that parses untrusted text. Nested array literals in Mox
+(`<?mox $x = [[[…1…]]];`) parsed in about 80 ms at fifty levels (a debug
+build of LexerSketch) and did not finish at sixty; sixty-five nested `list(`
+calls took 77 s, and more did not finish. The depth limit now stops the parse
+in time linear in the input, and every parse is held to a step budget
+proportional to its input.
+
+### Breaking
+
+- **The depth limit stops the parse** (both formats). Reaching 768 grammar
+  levels, even in an alternative or a predicate the parser is only trying,
+  ends the parse at once: one `LF1003` diagnostic at the token where the
+  limit was reached, the tree as far as the parse had committed to it, the
+  rest of the input in one `ERROR` node (the tree stays lossless), and
+  nothing after the stop parsed or reported. Before, the limit failed the
+  attempt that reached it, and parsing went on. A failed attempt was retried
+  by every alternative, predicate, and optional above it, and a result that
+  depended on how deep it began could not be memoized, so each level of
+  nesting past the limit multiplied the work. Treating the limit as a failure
+  was also a guess: an alternative that reached the limit might have matched.
+  Because an attempt can go deeper than the parse it guards, the limit can
+  now be reached by input 1.x accepted: in the Mox sketch, array literals stop
+  at 54 levels of nesting and `list(` calls at 63, where alpha.1 accepted 55
+  and 64 (in 118 ms and 28 ms), took 77 s over 65 `list(` calls, and did not
+  finish beyond. Inputs past the limit also report one
+  diagnostic now instead of a cascade.
+- **Every parse has a step budget.** A parse that would take more than
+  `ParseBudget::DEFAULT` (1,048,576 steps plus 4,096 per significant token)
+  stops with `LF9002`, the same way. Ordinary input takes 3 to 15 steps per
+  token and the deepest Mox nesting about 2,000, so only inputs whose cost is
+  super-linear in the grammar or the input reach it; `ParseBudget::new(u64::MAX,
+  0)` turns it off.
+
+### Migration guide
+
+1. Change `lang-forge = "2.0.0-alpha.1"` to `lang-forge = "2.0.0-alpha.2"`.
+2. If you relied on code after a too-deep construct being parsed and checked,
+   it no longer is: the parse stops at the limit. Look for `LF1003` (or
+   `LF9002`) to tell a stopped parse from an ordinary error.
+3. A tool that runs sketches it did not write can bound a parse's time with
+   `Language::with_parse_budget(ParseBudget::new(base, per_token))`.
+
+### Added
+
+- `ParseBudget` (`DEFAULT`, `new`, `base`, `per_token`, `steps`, `Default`):
+  a cap on the parser's work, `base + per_token × significant tokens`.
+- `Language::with_parse_budget` and `Language::parse_budget`. The budget is a
+  setting of the `Language` value, not part of the language or its image.
+- `Parse::steps`: the work a parse took, in the budget's steps, injections
+  included.
+- Diagnostic code `LF9002`: a parse that used up its budget.
+- `tests/limits.rs`: Mox nested arrays and `list(` calls at 50, 60, 100, and
+  10,000 levels held to a step count; nesting just under the limit; cycles
+  the progress guard cuts; a grammar whose cost is exponential in its size;
+  quadratic speculation; the budget across `parse_file` and injections; and a
+  property that random, broken nesting over a small grammar never takes more
+  than 64 steps per token with no budget to stop it.
+- Benches `v2/parse/mox_arrays/50x200` (the deepest Mox nesting, the most
+  work per token the sketch takes) and `v2/parse/mox_arrays/10000` (a stop).
+
+### Fixed
+
+- **Exponential time past the depth limit** (the denial of service above).
+- **Exponential time on cycles the progress guard cuts.** When the guard cut
+  a cycle of rules that consumes nothing (possible where the end of the input
+  stands for a line break), every result around it was kept out of the memo,
+  so speculation over unclosed blocks before the end of input doubled its
+  work per level: 2.6 s at 22 levels in a grammar whose statement list
+  recurses through `NEWLINE`. A result is now kept unless the cycle ran
+  through a rule invocation outside it, and one whose cycle was at its own
+  position is replayed only where no rule is active there yet.
+- **Memoized parsing could pass the depth limit where unmemoized parsing
+  stopped** (a gap left by the P09 fix): how deep a remembered attempt went
+  did not include the attempts it replayed. Replays now count their depth.
+- **Work no budget could see.** Tokens a strict attempt matched, operators in
+  a postfix chain, the alternatives of a choice, memo entries looked at, and
+  events copied by a replay are all counted, so speculation that rescans the
+  input from every token (quadratic) is stopped by the budget; before, a
+  `IDENT* ';' | IDENT` statement over 100,000 identifiers took 18 s in alpha.1,
+  and would have taken as long under a budget that did not count tokens.
+- A contextual keyword operator was matched by scanning every rule of the
+  grammar for the expression rule that owns the operator table; it is now
+  looked up directly, and identifiers that spell no keyword skip the search.
+- An error message is built only when it is reported (at most one per
+  token): recovery asking several times at one token, with a large expected
+  set, no longer formats the message each time; describing an expected set
+  reads at most seven members of it.
+
+### Notes
+
+- The LSF2 work scheduled for alpha.2 in alpha.1's ROADMAP (sketch
+  composition, token splitting, hooks that run, and the rest refused with
+  `LSF1007`) moves to alpha.3: this release is the fix above alone. The
+  `.lsf` format, the trees for input within the limits, and the image format
+  are unchanged.
+- Performance on the 1.x and v2 parse benchmarks is within noise of alpha.1
+  (several measured slightly faster); figures in the release notes.
+
+---
+
 ## [2.0.0-alpha.1] - 2026-10-09
 
 The first pre-release of 2.0: LSF2, LexerSketch's format-2 sketch syntax, as
@@ -390,7 +494,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/lang-forge/compare/v2.0.0-alpha.1...HEAD
+[Unreleased]: https://github.com/jamesgober/lang-forge/compare/v2.0.0-alpha.2...HEAD
+[2.0.0-alpha.2]: https://github.com/jamesgober/lang-forge/compare/v2.0.0-alpha.1...v2.0.0-alpha.2
 [2.0.0-alpha.1]: https://github.com/jamesgober/lang-forge/compare/v1.0.1...v2.0.0-alpha.1
 [1.0.1]: https://github.com/jamesgober/lang-forge/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jamesgober/lang-forge/compare/v0.2.0...v1.0.0

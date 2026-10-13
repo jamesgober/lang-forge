@@ -291,6 +291,8 @@ codes! {
     // ----- program problems: limits -----
     /// A source too large to address.
     SOURCE_TOO_LARGE = "LF" 9001;
+    /// A parse that used up its step budget.
+    PARSE_BUDGET = "LF" 9002;
 }
 
 #[cfg(test)]

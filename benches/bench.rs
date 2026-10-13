@@ -224,6 +224,24 @@ fn bench_v2(c: &mut Criterion) {
             b.iter(|| mox.parse(black_box(src)));
         });
     }
+    // Nesting (2.0.0-alpha.2): array literals 50 deep, just under the depth
+    // limit and the most work per token the sketch takes (each entry's
+    // predicate parses the entry once more, at every level), repeated over
+    // 200 statements; and 10,000 deep, which stops at the limit at once
+    // (2.0.0-alpha.1 never finished 60).
+    let deep = format!("$x = {}1{};\n", "[".repeat(50), "]".repeat(50));
+    for (name, src) in [
+        ("mox_arrays/50x200", format!("<?mox\n{}", deep.repeat(200))),
+        (
+            "mox_arrays/10000",
+            format!("<?mox $x = {}1{};", "[".repeat(10_000), "]".repeat(10_000)),
+        ),
+    ] {
+        group.throughput(Throughput::Bytes(src.len() as u64));
+        group.bench_with_input(BenchmarkId::new("parse", name), &src, |b, src| {
+            b.iter(|| mox.parse(black_box(src)));
+        });
+    }
     group.finish();
 }
 

@@ -2,7 +2,9 @@
 
 > Complete reference for every public item in `lang-forge`, with examples, and
 > for the `.lsf` schematic format it reads.
-> **Status: `2.0.0-alpha.1`, a pre-release of 2.0.** Everything 1.x provides
+> **Status: `2.0.0-alpha.2`, a pre-release of 2.0.** Alpha.2 makes the
+> parser's limits stop a parse in linear time and adds a step budget
+> ([`ParseBudget`](#parsebudget)). Everything 1.x provides
 > is kept, and format-1 sketches forge and parse exactly as in 1.x; the
 > format-2 (LSF2) syntax, multi-file sketches, language images, field labels,
 > and diagnostic codes are new and may still change before `2.0.0`. See
@@ -68,6 +70,7 @@
   - [`Language::supertype` and `Language::supertypes`](#languagesupertype-and-languagesupertypes)
   - [`Language::warnings`](#languagewarnings)
   - [`Language::parse_file`](#languageparse_file)
+  - [`Language::with_parse_budget` and `Language::parse_budget`](#languagewith_parse_budget-and-languageparse_budget)
 - [`Parse`](#parse)
   - [`Parse::tree`](#parsetree)
   - [`Parse::source`](#parsesource)
@@ -78,6 +81,8 @@
   - [`Parse::into_tree`](#parseinto_tree)
   - [`Parse::dump`](#parsedump)
   - [`Parse::injections`](#parseinjections)
+  - [`Parse::steps`](#parsesteps)
+- [`ParseBudget`](#parsebudget)
 - [`Kind`](#kind)
 - [`Injection`](#injection)
 - [`Field` and `Cardinality`](#field-and-cardinality)
@@ -126,7 +131,7 @@ those crates are not part of lang-forge and arrive with LexerSketch.
 
 ```toml
 [dependencies]
-lang-forge = "2.0.0-alpha.1"
+lang-forge = "2.0.0-alpha.2"
 ```
 
 The crate is `no_std`-compatible: disable default features and it needs only
@@ -134,7 +139,7 @@ The crate is `no_std`-compatible: disable default features and it needs only
 
 ```toml
 [dependencies]
-lang-forge = { version = "2.0.0-alpha.1", default-features = false }
+lang-forge = { version = "2.0.0-alpha.2", default-features = false }
 ```
 
 MSRV: Rust 1.85 (Rust 2024 edition). `syntax-lang`, `diag-lang`, and
@@ -798,7 +803,7 @@ the node and `kind("'instanceof'")` the keyword.
 ### LSF2 coverage
 
 Every key of LSF2's syntax sections (§3, §4, §7–§14) and its status in
-`2.0.0-alpha.1`. **Yes**: read and applied. **Checked**: read and validated;
+`2.0.0-alpha.2` (unchanged since alpha.1). **Yes**: read and applied. **Checked**: read and validated;
 its effect belongs to another crate (named), so lang-forge applies nothing.
 **Refused**: read and refused — with `LSF1007` naming the roadmap item
 unless another code is given — never silently ignored. Items marked *alpha.2* are scheduled in
@@ -887,7 +892,7 @@ Format-1 diagnostics carry codes too; their messages are unchanged.
 | `LSF9001`–`LSF9008` | sketch | limits |
 | `LF0001`–`LF0014` | source | lexical errors: unexpected characters, unterminated strings and comments, malformed numbers, NFC, modes, indentation |
 | `LF1000`–`LF1004` | source | parse errors: expected token, leftover input, chained non-associative operator, nesting too deep, back-reference mismatch |
-| `LF9001` | source | a source larger than 4 GiB |
+| `LF9001`–`LF9002` | source | limits: a source larger than 4 GiB; a parse that used up its step budget |
 
 Source codes follow diag-lang's phase ranges, so "is this a lexical error?"
 is a range check:
@@ -967,7 +972,8 @@ work as possible:
   the same token, each is tried in turn in a strict mode that fails fast and
   records nothing, and the parser rewinds between attempts.
 - **Memoized attempts.** Every strict attempt at a rule is remembered by rule
-  and position for as long as the outermost speculation lasts, so alternatives
+  and position for as long as the outermost speculation lasts, except an
+  attempt the progress guard made depend on its context (see [Limits](#limits)), so alternatives
   that share a prefix through different rules — `assign = expr '=' expr ';'`
   against `expr ';'` — parse that prefix once. Without this, nested input
   would cost time exponential in its depth; with it, parsing stays linear in
@@ -1001,10 +1007,8 @@ Parsing always completes:
   an unterminated string, may sit on the same token), and a run of skipped tokens is
   one error.
 - **Input after the start rule** is wrapped in one `ERROR` node with one error.
-- **Input nested too deeply** is reported once and not followed, so no input
-  can exhaust the stack. While speculating over such input, each decision
-  tries only its first viable alternative, which keeps that speculation
-  linear; the code after it is parsed in full. Every recursive step of the parser counts against a
+- **Input nested too deeply** stops the parse, so no input can exhaust the
+  stack or the clock; see [Limits](#limits). Every recursive step of the parser counts against a
   limit of 768 grammar levels, which needs at most about 256 KiB of stack in a
   release build and 768 KiB in a debug build — within every default thread,
   including the 1 MiB Windows main thread — and allows well over a hundred
@@ -1012,6 +1016,50 @@ Parsing always completes:
 
 On input without errors, recovery never engages and the tree is exactly the
 one the grammar describes.
+
+### Limits
+
+Two limits stop a parse where it is, strict attempt or not, in time linear in
+the input:
+
+- **The depth limit** (768 grammar levels): reaching it, even in an
+  alternative or a predicate the parser is only trying, stops the parse with
+  one `LF1003` diagnostic at the token where the limit was reached.
+- **The step budget** ([`ParseBudget`](#parsebudget)): a parse that would
+  take more steps than `base + per_token × tokens` stops with one `LF9002`
+  diagnostic at the token it reached.
+
+After a stop, the tree keeps everything the parse had committed to (an
+attempt in progress is rewound), the tokens not yet parsed go into one
+`ERROR` node inside the innermost open node, and every open node is closed,
+so the tree is still lossless. Nothing after the stop is parsed or reported.
+
+A stop is not a failed attempt, by design. A failure would be retried: the
+next alternative, the item after a failed predicate, the operand after a
+failed lookahead would each go down the same too-deep path again, and a
+result that depends on how deep it began cannot be memoized, so every level
+past the limit multiplied the work. 2.0.0-alpha.1 worked that way and never
+finished sixty nested array literals in Mox. A failure is also the wrong
+answer: an alternative that reached the limit might have matched, and
+choosing the next one would be a guess.
+
+Stopping on an attempt means the limit can be reached on input whose
+committed parse would fit: a predicate that parses an entry before the entry
+is parsed (Mox's `&(expr '=>')` idiom) goes a level or two deeper per level of
+nesting than the parse it guards. In the Mox sketch, array literals stop at 54
+levels of nesting and `list(` calls at 63; 2.0.0-alpha.1 accepted a level or
+two more before it hung.
+
+The one other path that cannot always be memoized is the progress guard,
+which cuts a cycle of rules that consumes nothing (possible only where the end
+of the input stands for a line break, or through a positive predicate): the
+result of a rule depends on which rules are active around it. A result is
+remembered when the cycle the guard cut runs only through the rule's own
+invocation and those inside it, and replayed only where no rule is active at
+its position yet if the cycle was at that position. A cycle through an
+invocation outside keeps that result out of the memo. Within one position this
+can still cost time exponential in the number of rules in such a cycle (a
+property of the grammar, not of the input), which the budget bounds.
 
 ### What forging checks
 
@@ -1339,7 +1387,10 @@ pub fn parse<'a>(&'a self, source: &'a str) -> Parse<'a>
 
 Parses `source` into a lossless syntax tree. Never fails: problems become
 diagnostics on the returned [`Parse`](#parse), and the tree is complete
-regardless. See [Error recovery](#error-recovery).
+regardless. See [Error recovery](#error-recovery). The depth limit and the
+[step budget](#languagewith_parse_budget-and-languageparse_budget) stop the
+parse in time linear in the input, keeping the tree lossless; see
+[Limits](#limits).
 
 | Parameter | Meaning |
 |---|---|
@@ -1366,13 +1417,17 @@ assert_eq!(bad.tree().child_nodes().filter(|n| *n.kind() == stmt).count(), 2);
 ```rust
 use lang_forge::Language;
 
-// Deeply nested input is reported, not followed.
+// Deeply nested input stops the parse: one diagnostic, at the depth limit,
+// after about a thousand steps however deep the input goes.
 let lang = Language::from_lsf(
     "[language]\nname = \"p\"\n[rules]\nvalue = \"NUMBER | '(' value ')'\"\n",
 )?;
 let source = format!("{}1{}", "(".repeat(10_000), ")".repeat(10_000));
 let parse = lang.parse(&source);
+assert_eq!(parse.diagnostics().len(), 1);
 assert!(parse.diagnostics()[0].message().contains("nested too deeply"));
+assert!(parse.steps() < 2_000);
+// Still lossless: the tokens not parsed are kept in an `ERROR` node.
 assert_eq!(parse.tree().text(&source).map(str::len), Some(source.len()));
 # Ok::<(), lang_forge::Error>(())
 ```
@@ -1789,6 +1844,43 @@ assert_eq!(lang.kind_name(*single.tree().kind()), "item");
 # Ok::<(), lang_forge::Error>(())
 ```
 
+### `Language::with_parse_budget` and `Language::parse_budget`
+
+```rust,ignore
+pub fn with_parse_budget(self, budget: ParseBudget) -> Self
+pub fn parse_budget(&self) -> ParseBudget
+```
+
+`with_parse_budget` returns the language with every later parse held to
+`budget` (see [`ParseBudget`](#parsebudget)); `parse_budget` returns the budget
+in force. A language starts with `ParseBudget::DEFAULT`, which ordinary input
+never reaches; a tool running sketches it did not write can set a tighter one
+to bound how long a hostile grammar can keep it busy.
+
+The budget is a setting of the `Language` value, not part of the language: it
+is not stored in an [image](#languageto_image-and-languagefrom_image), and a
+loaded or newly forged language starts with the default.
+
+| Parameter | Meaning |
+|---|---|
+| `budget` | The cap on each parse's steps, from its significant tokens. |
+
+```rust
+use lang_forge::{Language, ParseBudget};
+
+let lang = Language::from_lsf("[language]\nname = \"n\"\n[rules]\nfile = \"item*\"\nitem = \"NUMBER\"\n")?;
+assert_eq!(lang.parse_budget(), ParseBudget::DEFAULT);
+
+// At most 100 steps, however long the input.
+let strict = lang.with_parse_budget(ParseBudget::new(100, 0));
+assert!(!strict.parse(&"1 ".repeat(40)).has_errors());
+let source = "1 ".repeat(500);
+let stopped = strict.parse(&source);
+assert_eq!(stopped.diagnostics().len(), 1);
+assert_eq!(stopped.steps(), 100);
+# Ok::<(), lang_forge::Error>(())
+```
+
 ## `Parse`
 
 ```rust,ignore
@@ -2033,6 +2125,111 @@ let lang = Language::from_lsf(
 let parse = lang.parse("<b><% x %></b>");
 let ranges: Vec<(&str, bool)> = parse.injections().iter().map(|i| (i.language(), i.is_editor())).collect();
 assert_eq!(ranges, [("html", true), ("html", true)]);
+# Ok::<(), lang_forge::Error>(())
+```
+
+### `Parse::steps`
+
+```rust,ignore
+pub fn steps(&self) -> u64
+```
+
+The steps the parser took, self-injections included, as the
+[`ParseBudget`](#parsebudget) counts them: a measure of the parse's work that
+does not depend on the machine. A parse the budget stopped took its budget,
+give or take a step and the cheap work (alternatives examined, events copied)
+that came with it. A source of 4 GiB or more, which is not parsed, took none.
+
+Ordinary input takes 3 to 15 steps per significant token on the example
+languages and the Mox corpus; input nested just under the depth limit can take
+several hundred, and up to about 2,000 in the Mox sketch.
+
+```rust
+use lang_forge::Language;
+
+let lang = Language::from_lsf("[language]\nname = \"n\"\n[rules]\nfile = \"item*\"\nitem = \"NUMBER\"\n")?;
+let short = lang.parse("1 2").steps();
+let long = lang.parse(&"1 ".repeat(1000)).steps();
+// Linear in the input: two steps per item (the rule and its token), one for the repetition.
+assert_eq!((short, long), (5, 2001));
+# Ok::<(), lang_forge::Error>(())
+```
+
+## `ParseBudget`
+
+```rust,ignore
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ParseBudget { /* private */ }
+
+impl ParseBudget {
+    pub const DEFAULT: Self;                     // 1,048,576 + 4,096 per token
+    pub const fn new(base: u64, per_token: u64) -> Self;
+    pub const fn base(self) -> u64;
+    pub const fn per_token(self) -> u64;
+    pub const fn steps(self, tokens: usize) -> u64;
+}
+impl Default for ParseBudget                     // DEFAULT
+```
+
+How much work one parse may do before it stops: a cap on the parser's steps,
+proportional to the input. A parse of `n` significant tokens (comments and
+whitespace do not count) may take `base + per_token × n` steps, saturating at
+`u64::MAX`. A **step** is one grammar level entered (a rule, a sequence, a
+choice, a repetition, an optional, a predicate, a label, or an operator's
+operand), one token matched, or one operator. The cheap units of work whose
+number the grammar or the memo sets — an alternative examined, a remembered
+attempt looked at, a tree event copied from one — are an eighth of a step
+each. Every loop the parser runs is counted, so the budget bounds the parser's
+time whatever the grammar; it does not bound the lexer or the tree, which take
+time linear in the input regardless.
+
+A parse that would take more **stops** at the token it reached, with one
+`LF9002` diagnostic ("the parse took more than N steps, the budget for this
+input"); the tree stays lossless, the tokens not yet parsed kept in one
+`ERROR` node, as at the depth limit. See [Limits](#limits).
+
+| Item | Meaning |
+|---|---|
+| `DEFAULT` | 1,048,576 steps plus 4,096 per token: every language starts with it. |
+| `new(base, per_token)` | `base` steps whatever the input, plus `per_token` for each significant token. `new(u64::MAX, 0)` is no budget; `per_token` zero is an absolute cap. |
+| `base()`, `per_token()` | The two parts. |
+| `steps(tokens)` | The steps allowed for `tokens` significant tokens. |
+
+**What the default allows.** Parsing is linear in the input for a given
+grammar. Ordinary input takes 3 to 15 steps per token on the example
+languages and the Mox corpus; the most the Mox sketch takes is about 2,000 per
+token, for wide array literals nested just under the depth limit (each entry's
+predicate parses the entry once more at every level). The default leaves a
+margin of about two over that, so it is reached only by what it exists for: a
+grammar whose cost per token grows with the grammar (a cycle the progress
+guard cuts at the end of the input, exponential in the number of rules in it)
+and inputs that make speculation scan far ahead from every token (an
+alternative that consumes a long run before failing, followed by a short one
+that matches, at every position: `a = "IDENT* ';'"` before `b = "IDENT"` over
+ten thousand identifiers would take about 50 million steps, and stops at its
+budget of 42 million). At 4 to 15 ns
+a step on a current desktop CPU, a parse that spends the whole default budget
+takes about 5 to 15 ms for the base and 15 to 60 ms per thousand tokens; a
+tool running sketches it did not write, such as an editor preview, can set a
+tighter or absolute budget with
+[`Language::with_parse_budget`](#languagewith_parse_budget-and-languageparse_budget).
+
+The budget covers [`parse`](#languageparse), [`parse_file`](#languageparse_file),
+and each self-injection, which has its own budget from its own tokens.
+
+```rust
+use lang_forge::{Language, ParseBudget};
+
+assert_eq!(ParseBudget::DEFAULT.steps(10), (1 << 20) + 40_960);
+assert_eq!(ParseBudget::new(10, 2).steps(5), 20);
+
+let lang = Language::from_lsf("[language]\nname = \"n\"\n[rules]\nfile = \"item*\"\nitem = \"NUMBER\"\n")?
+    .with_parse_budget(ParseBudget::new(16, 0));
+assert!(!lang.parse("1 2 3").has_errors());
+let source = "7 ".repeat(100);
+let parse = lang.parse(&source);
+assert_eq!(parse.diagnostics()[0].code().map(|c| c.to_string()).as_deref(), Some("LF9002"));
+assert_eq!(parse.tree().text(&source), Some(source.as_str()));
 # Ok::<(), lang_forge::Error>(())
 ```
 
@@ -2541,13 +2738,13 @@ assert_eq!(broken.diagnostics()[0].message(), "expected a line break, found iden
 
 ## Stability
 
-This reference describes `2.0.0-alpha.1`, a **pre-release** of lang-forge
+This reference describes `2.0.0-alpha.2`, a **pre-release** of lang-forge
 2.0. lang-forge follows [Semantic Versioning](https://semver.org/).
 
 **What 2.0 keeps from 1.x.** A format-1 sketch (no `[sketch]` table, or
 `[sketch] format = 1`) forges and parses exactly as under 1.x: the same
-language, the same trees for every input (kind names, shapes, spans), and the
-same diagnostic messages. The format-1 reader is the 1.x reader, unchanged,
+language, the same trees for every input within the parser's limits (kind
+names, shapes, spans), and the same diagnostic messages. The format-1 reader is the 1.x reader, unchanged,
 and the whole 1.x test suite runs against it. Every 1.x method and type is
 still there with the same signature, and the 1.x guarantees hold for both
 formats: parsing never fails and never panics; every tree is lossless;
@@ -2566,11 +2763,23 @@ stack; forging never panics; and `dump` keeps its format (format-2 trees add
   Equality, ordering, and hashing ignore the label, so format-1 code is
   unaffected unless it relied on the size.
 - `diag-lang` is required at `1.1` or later (diagnostic codes).
+- *(2.0.0-alpha.2)* Input that reaches the depth limit stops the parse, in
+  either format: one `LF1003` diagnostic, the rest of the input in one `ERROR`
+  node, and nothing after the stop parsed or reported. 1.x reported the limit
+  and parsed on. The limit is now also reached when only an alternative or a
+  predicate the parser tries goes that deep, which 1.x treated as a failed
+  attempt. See [Limits](#limits).
+- *(2.0.0-alpha.2)* Every parse is held to a step budget; input that costs
+  more than 4,096 steps a token (plus a base of about a million) stops with
+  `LF9002` where 1.x went on, however long it took. No input of the example
+  languages or the Mox corpus comes near it; `ParseBudget::new(u64::MAX, 0)`
+  turns it off.
 
 **What the alpha does not promise yet.** The format-2 surface — LSF2's
 syntax as this release reads it, the new methods and types (`Sketch`,
-`Injection`, `Field`, `Cardinality`, `ImageError`, `IMAGE_FORMAT`, and the
-`Language` methods added in 2.0), kind numbering in format 2, field
+`Injection`, `Field`, `Cardinality`, `ImageError`, `IMAGE_FORMAT`,
+`ParseBudget`, `Parse::steps`, and the `Language` methods added in 2.0), what
+counts as a step and the default budget, kind numbering in format 2, field
 derivation, and the image format — may change before `2.0.0`. The image
 format is versioned (`IMAGE_FORMAT`): an image of another format is refused,
 never misread, so re-forge after upgrading. Keys LSF2 specifies that this

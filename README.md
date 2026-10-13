@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, no dependencies outside the <code>-lang</code> family.
     </p>
     <blockquote>
-        <strong>2.0.0-alpha.1 is a pre-release of 2.0.</strong> It adds LSF2, the format-2 sketch syntax (token classes, lexer modes, interpolated strings and heredocs, contextual keywords, layout, labelled fields, predicates, injections), multi-file sketches, language images, and diagnostic codes. A format-1 schematic forges and parses exactly as in 1.x. The breaking changes are small and listed with a migration guide in <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>; the format-2 surface may still change before <code>2.0.0</code>. See <a href="./docs/API.md#stability"><code>docs/API.md</code></a>.
+        <strong>2.0.0-alpha.2 is a pre-release of 2.0.</strong> It fixes a denial of service in alpha.1: input nested past the parser's depth limit, such as sixty nested array literals in Mox, never finished parsing. The depth limit now stops the parse in linear time with one located diagnostic, and a step budget proportional to the input bounds every parse. The 2.0 line adds LSF2, the format-2 sketch syntax (token classes, lexer modes, interpolated strings and heredocs, contextual keywords, layout, labelled fields, predicates, injections), multi-file sketches, language images, and diagnostic codes. A format-1 schematic forges and parses exactly as in 1.x. The breaking changes are small and listed with a migration guide in <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>; the format-2 surface may still change before <code>2.0.0</code>. See <a href="./docs/API.md#stability"><code>docs/API.md</code></a>.
     </blockquote>
 </div>
 
@@ -46,6 +46,7 @@ One type per job:
 - A **[`Field`](./docs/API.md#field-and-cardinality)** describes a labelled field of a node kind: its name, the kinds it holds, and how many.
 - A **[`Sketch`](./docs/API.md#sketch)** holds the files of a multi-file sketch.
 - An **[`Error`](./docs/API.md#error)** lists everything wrong with a schematic, each problem pointing into the schematic text and carrying a stable code.
+- A **[`ParseBudget`](./docs/API.md#parsebudget)** caps the work of one parse in proportion to its input; the default is never reached by ordinary input.
 - A **[`Capability`](./docs/API.md#capability)** is a boxed `pass-lang` pass that a schematic can include by name.
 
 <br>
@@ -55,6 +56,7 @@ What the crate guarantees:
 | Guarantee | How it is held |
 |---|---|
 | Parsing never fails, never panics, and never overflows the stack. | Recovery is built into the parser. Recursion is bounded at 768 grammar levels — at most about 256 KiB of stack in release builds, 768 KiB in debug — and deeper input is reported, not followed. Property tests throw random text and token soup at every example language. |
+| Parsing takes time linear in the input, and a hostile grammar or input ends with an error, not a hang. | Input past the depth limit stops the parse at once, with one `LF1003` diagnostic where the limit was reached; a step budget proportional to the input (`ParseBudget`, configurable) stops anything else that would run on, with `LF9002`. The tree stays lossless either way. [`tests/limits.rs`](./tests/limits.rs) holds nesting from 50 to 10,000 levels, and random nesting, to a step count per token. |
 | Every tree is lossless: it covers every byte of the source, whitespace and comments included. | Tested on every parse in the suite, and as a property over arbitrary input. |
 | On input without errors, the tree is the one the grammar describes. | A strict reference parser runs in the tests; whenever the recovering parser reports no error, the two trees must be identical. |
 | A schematic the parser could not run is refused when it is forged. | Left recursion, repetitions that could loop forever, unreachable alternatives, and literals the lexer cannot produce are all errors, with the rule and the fix named. |
@@ -70,7 +72,7 @@ What the crate guarantees:
 
 ```toml
 [dependencies]
-lang-forge = "2.0.0-alpha.1"
+lang-forge = "2.0.0-alpha.2"
 ```
 
 Or from the terminal:
@@ -411,8 +413,10 @@ Measured with the benchmarks in [`benches/`](./benches), x86_64, Rust stable, re
 | `v2/lex/mox_script/1MB` | Tokenize 1 MB of Mox script (mode-stack scanner). | ~12.7 ms (79 MiB/s) | — |
 | `v2/parse/mox_script/1MB` | Parse 1 MB of Mox script. | ~70 ms | — |
 | `v2/parse/mox_template/256KB` | Parse 256 KB of Mox template (HTML with islands). | ~7.6 ms | — |
+| `v2/parse/mox_arrays/50x200` | 200 statements, each an array literal nested 50 deep: the most work per token the Mox sketch takes. | ~194 ms | — |
+| `v2/parse/mox_arrays/10000` | One array literal nested 10,000 deep: stops at the depth limit after about 1,100 steps (2.0.0-alpha.1 never finished 60). | ~0.8 ms | — |
 
-The format-1 rows were measured for 1.x; 2.0.0-alpha.1 measures within noise of 1.0.1 on them when the two run back to back, except forging (up to about 1 µs slower), the operator chain (6–12 %), and error-heavy input (10–19 %) — see the [release notes](./docs/release/v2.0.0-alpha.1.md#measurements). The format-2 scanner is about five times slower per byte than format 1's derived lexer. On large inputs the cost is dominated by the tree itself: on Linux, for the 1 MB mini file, lexing takes about 2 ms and the parser about 3 ms, while allocating the tree's nodes takes about 6 ms and freeing them 13 ms. Run them yourself:
+The format-1 rows were measured for 1.x; 2.0.0-alpha.1 measures within noise of 1.0.1 on them when the two run back to back, except forging (up to about 1 µs slower), the operator chain (6–12 %), and error-heavy input (10–19 %) — see the [release notes](./docs/release/v2.0.0-alpha.1.md#measurements). 2.0.0-alpha.2 measures within noise of 2.0.0-alpha.1 on every parse benchmark ([release notes](./docs/release/v2.0.0-alpha.2.md#measurements)). The format-2 scanner is about five times slower per byte than format 1's derived lexer. On large inputs the cost is dominated by the tree itself: on Linux, for the 1 MB mini file, lexing takes about 2 ms and the parser about 3 ms, while allocating the tree's nodes takes about 6 ms and freeing them 13 ms. Run them yourself:
 
 ```bash
 cargo bench --bench bench
@@ -428,7 +432,8 @@ Criterion writes per-benchmark reports to `target/criterion/`. Numbers vary by C
 - **Interpreted, not generated.** A forged language is tables plus a small interpreter, not Rust source to compile. Changing a schematic takes microseconds, a tool can forge languages at run time, and every language shares one well-tested parser.
 - **Ordered choice, pruned by FIRST sets.** Alternatives are tried in order and the first that matches wins, as in a parsing expression grammar, which is forgiving to write. FIRST sets prune the attempt before it starts, so for nearly every decision exactly one alternative remains and the parser commits at once. Alternatives that begin alike are left-factored when the language is forged, which removes most of the remaining ambiguity — and reveals alternatives that could never match.
 - **Recovery that respects structure.** A missing token is assumed; an unwanted token is skipped into an `ERROR` node; and skipping stops at any token an enclosing construct is waiting for, so one mistake does not swallow the rest of a block. The parser reports at most one syntax error per token.
-- **Errors, not panics.** Schematic problems are values with spans; source problems are diagnostics. Every recursive step of the parser counts against a fixed limit, so input nested beyond it is reported instead of followed and no input can exhaust the stack. Input nested too deeply limits only the speculation it is part of; the code after it is parsed in full.
+- **Errors, not panics.** Schematic problems are values with spans; source problems are diagnostics. Every recursive step of the parser counts against a fixed limit, so input nested beyond it is reported instead of followed and no input can exhaust the stack.
+- **Limits stop the parse; they never fail an attempt.** Reaching the depth limit, even in an alternative the parser is only trying, stops the whole parse: the tree keeps what was parsed, the rest of the input goes into one `ERROR` node, and one diagnostic says where. A failure would be retried by every alternative at every level, and the next alternative chosen would be a guess. In 2.0.0-alpha.1 that retrying took exponential time past the limit. The cost of stopping is that nothing after the stop is parsed or reported. Every parse is also held to a step budget proportional to its input, so a grammar that costs more per token than any sane one ends with an error instead of running on.
 - **Budgets on hostile schematics.** A schematic is at most 8 MiB and nests at most 64 levels (table, key, array, and inline-table levels counted together); the parser tables that grow with rules times token kinds are capped at 256 MiB and refused before they are allocated; duplicate-key checks are logarithmic, not scans.
 - **The schematic is static.** NOML's dynamic features — environment lookups, includes, native types — are refused, so a schematic forges the same language on every machine. What NOML (and TOML) call invalid is refused too, even where no setting would use it.
 - **Byte-order marks.** A leading UTF-8 byte-order mark is skipped in a schematic, and in source text it is trivia: it begins the first `WHITESPACE` token, so trees stay lossless.
@@ -448,7 +453,7 @@ cargo bench --bench bench
 
 Format 2 has its own suites: [`tests/v2_lexer.rs`](./tests/v2_lexer.rs) and [`tests/v2_grammar.rs`](./tests/v2_grammar.rs) (every feature, with its diagnostics and codes), [`tests/mox.rs`](./tests/mox.rs) (the Mox sketch and representative scripts and templates), [`tests/sketch.rs`](./tests/sketch.rs) (multi-file sketches), [`tests/image.rs`](./tests/image.rs) (images, including mutated ones), and [`tests/regressions_v2.rs`](./tests/regressions_v2.rs) (forging and lexing budgets on hostile input). The parser's format-2 properties hold the recovering parser to the strict reference parser and memoized to unmemoized parsing, labels included.
 
-The property tests in [`tests/proptests.rs`](./tests/proptests.rs) generate random valid mini programs, which must parse without a single diagnostic; random token soup and arbitrary Unicode text, which must parse into lossless, properly nested trees in every example language; and arbitrary and randomly mutated schematics, which must forge or fail cleanly. Further properties, in the parser's unit tests, hold the recovering parser to a strict reference parser on every input it accepts without error, and require memoization never to change a tree or a diagnostic on input within the depth limit. [`tests/regressions.rs`](./tests/regressions.rs) keeps every input an adversarial review used against the crate — stack-exhausting grammars, exponential and quadratic speculation, recursion without progress, hostile schematics — and holds them to time and stack bounds; [`tests/memory.rs`](./tests/memory.rs) measures peak heap use with a counting allocator and holds forging and parsing to memory bounds. Every `rust` example in this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a doctest.
+The property tests in [`tests/proptests.rs`](./tests/proptests.rs) generate random valid mini programs, which must parse without a single diagnostic; random token soup and arbitrary Unicode text, which must parse into lossless, properly nested trees in every example language; and arbitrary and randomly mutated schematics, which must forge or fail cleanly. Further properties, in the parser's unit tests, hold the recovering parser to a strict reference parser on every input it accepts without error, and require memoization never to change a tree or a diagnostic, on input that reaches the depth limit too. [`tests/limits.rs`](./tests/limits.rs) holds the depth limit and the step budget to their promises: Mox nesting from 50 to 10,000 levels, cycles the progress guard cuts, a grammar whose cost is exponential in its size, and random nesting held to a step count per token. [`tests/regressions.rs`](./tests/regressions.rs) keeps every input an adversarial review used against the crate — stack-exhausting grammars, exponential and quadratic speculation, recursion without progress, hostile schematics — and holds them to time and stack bounds; [`tests/memory.rs`](./tests/memory.rs) measures peak heap use with a counting allocator and holds forging and parsing to memory bounds. Every `rust` example in this README and in [`docs/API.md`](./docs/API.md) is compiled and run as a doctest.
 
 <hr>
 <br>

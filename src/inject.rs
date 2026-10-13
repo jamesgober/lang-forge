@@ -31,18 +31,22 @@ const MAX_DEPTH: u32 = 16;
 pub(crate) fn finish<'a>(
     language: &'a Language,
     source: &'a str,
-    tree: Node<Kind>,
-    mut diagnostics: Vec<Diagnostic>,
+    parsed: parser::Parsed,
 ) -> Parse<'a> {
+    let parser::Parsed {
+        tree,
+        mut diagnostics,
+        mut steps,
+    } = parsed;
     let grammar = language.tables();
     let Some(extra) = grammar.extra.as_deref() else {
-        return Parse::new(language, source, tree, diagnostics, Vec::new());
+        return Parse::new(language, source, tree, diagnostics, Vec::new(), steps);
     };
     if extra.injections.is_empty() && extra.embedded_parse.is_empty() {
-        return Parse::new(language, source, tree, diagnostics, Vec::new());
+        return Parse::new(language, source, tree, diagnostics, Vec::new(), steps);
     }
     let Lex::V2(scanner) = &grammar.lexer else {
-        return Parse::new(language, source, tree, diagnostics, Vec::new());
+        return Parse::new(language, source, tree, diagnostics, Vec::new(), steps);
     };
     let mut injections: Vec<Injection<'a>> = Vec::new();
     // Targets found in the host tree, then in each injected tree in turn.
@@ -70,7 +74,16 @@ pub(crate) fn finish<'a>(
                 let mut tokens = Vec::new();
                 let mut diags = Vec::new();
                 scanner.run_range(source, start, end, MAIN, &mut tokens, &mut diags);
-                let (tree, diags) = parser::parse_tokens(grammar, source, &tokens, rule, diags);
+                let parsed = parser::parse_tokens(
+                    grammar,
+                    source,
+                    &tokens,
+                    rule,
+                    diags,
+                    language.parse_budget(),
+                );
+                steps = steps.saturating_add(parsed.steps);
+                let (tree, diags) = (parsed.tree, parsed.diagnostics);
                 diagnostics.extend(diags);
                 collect(
                     &tree,
@@ -95,7 +108,7 @@ pub(crate) fn finish<'a>(
     }
     diagnostics.sort_by_key(|d| d.primary().span().start().to_u32());
     injections.sort_by_key(|i| (i.span().start().to_u32(), i.span().end().to_u32()));
-    Parse::new(language, source, tree, diagnostics, injections)
+    Parse::new(language, source, tree, diagnostics, injections, steps)
 }
 
 /// One range to inject.

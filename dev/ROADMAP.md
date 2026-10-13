@@ -94,7 +94,7 @@ Dependency wiring:
 - `syntax-lang` 1 and `pass-lang` 1 unchanged. No new dependencies; dev-dependencies still `criterion` and `proptest` only.
 - **`grammar-lang` still not wired.** Its regex/DFA construction was the reference for `src/regex/`, but it is not a dependency: its lexer DFA runs over bytes for its own token model (one automaton, longest match, its own priorities), while lang-forge needs one DFA per class over character-class alphabets, run-time conditions and modes, its own budgets and error codes, and a stable binary encoding for images. Depending on it would expose none of that and add a second token model to reconcile; reimplementing it (about 2,200 lines) kept the engine under lang-forge's budgets and image format.
 
-Deferred to **v2.0.0-alpha.2** (each refused with `LSF1007` in alpha.1, never ignored), with the reason:
+Deferred to **v2.0.0-alpha.2** (each refused with `LSF1007` in alpha.1, never ignored), with the reason. *(Moved to v2.0.0-alpha.3: alpha.2 became the parser-limits security fix; see below.)*
 - **Sketch composition** — `[language] extends`, `[compose]`, `[sketch] requires`, `kind = "mixin"`, sketch references (§3.5, §4): needs layer merge and conflict semantics (`LSF2010`–`LSF2021`) on top of multi-file sketches; Mox does not use it.
 - **`[lexer.split]`** (token splitting, `>>` into `>` `>` for generics): needs parser-driven re-lexing of a token; no alpha.1 consumer.
 - **`[lexer.columns] trivia`** (Fortran/COBOL column ranges): needs a column-trivia pass in the scanner; `tab_width` is done.
@@ -109,8 +109,41 @@ Deferred to **v2.0.0-alpha.2** (each refused with `LSF1007` in alpha.1, never ig
 - **Limits:** kinds are capped at 32,768 (15 index bits, as in 1.x) where LSF2 §1.8 allows 65,535; image warnings are not stored (a loaded language has no `warnings()`).
 - **Spec follow-ups for `_lexersketch`:** codes used that LSF2 §27 does not list yet (`LSF1007` not supported, `LSF4112` rule syntax, `LSF4305`–`LSF4310` format-1 grammar checks, `LSF7004`/`LSF7005` pipeline); Mox's `elseif_clause` needs `allow = ["overlap"]` like `if_stmt`.
 
+## v2.0.0-alpha.2 - Parser limits: linear time, a step budget (DONE, 2026-10-13)
+A security fix release, ahead of the LSF2 work alpha.1 scheduled here: past the depth limit, parsing time grew exponentially with each level of nesting (Mox: 56 nested array literals in the test copy of the sketch, 60 in the flagship, did not finish in 30 s; 65 `list(` calls took 77 s; LexerSketch hung). Scope set by the coordinator: make reaching the depth limit linear-time, audit every path the memo cannot cover, add an overall work budget (also serving `_lexersketch/ISSUES.md` P46, the Studio's forge timeout, on the parse side).
+
+Confirmed cause: `too_deep` failed the strict attempt that reached the limit and tainted it, so no result around it was memoized, and every retry point above it (each alternative, the item after a failed predicate, the operand after a failed lookahead such as Mox's `&(expr '=>')`) went down the same path again; instrumented, one level past the trip went from 16 to 327,600 limit hits and from 31 k to 7.8 M steps.
+
+Exit criteria:
+- [x] Reaching the depth limit is linear-time, with one located `LF1003` diagnostic and a lossless tree; depth-limited results never enter the memo.
+- [x] Every path the memo cannot cover audited; none multiplies work with the input.
+- [x] A step budget proportional to the input, configurable; hostile grammars and inputs end with `LF9002`.
+- [x] Mox nested arrays and `list(` calls at 50, 60, 100, 10,000 levels held to a step count; a property holds random nesting to a linear step bound.
+- [x] The existing suite passes unchanged (no test pinned the old soft-failure behaviour; `test_depth_limit_does_not_cripple_later_speculation` still passes as written, though the tail it checks is now unparsed rather than parsed).
+- [x] Benches: no regression on normal input against alpha.1.
+
+Delivered:
+- [x] **Limits stop the parse.** The depth limit and the budget are a hard stop of the whole parse, strict or not (`Parser::stop`): every retry point (alternatives, optionals, repetitions, predicates, recovering sequences) checks the stop and unwinds without retrying; the attempt in progress is rewound, the tokens not consumed go into one `ERROR` node, and every open node is closed (`close_stopped`). The `hit_limit` flag (M01's "one attempt per decision" workaround) and the depth taint are gone.
+- [x] **Progress-guard audit.** The guard cut a cycle and tainted every enclosing strict result (a global counter), which made speculation over unclosed blocks before the end of input exponential in nesting (2.6 s at 22 levels in a `stmts = "NEWLINE stmts | ..."` grammar). Results now record the depth and position of the invocation whose cycle was cut: a result is remembered unless the cycle ran through an invocation outside it, and a result whose cycle was at its own position is marked and replayed only where no rule is active at that position (`chain_start`). Both rules are load-bearing: a property test fails without the second.
+- [x] **P09 follow-up.** A replay now counts the depth its attempt went (`max_depth`), so an attempt that holds replays is never replayed where parsing it again would reach the limit (a unit test fails without it).
+- [x] **The budget** (`ParseBudget`, `Language::with_parse_budget`/`parse_budget`, `Parse::steps`, `LF9002`). Work is counted in ticks, eight to a step: a grammar level entered, a token matched, an operator is a step; an alternative examined, a memo entry looked at, an event copied is a tick. Counting tokens closed a hole the audit found: a strict attempt through `IDENT*` matched tokens on the fast path without a step, so quadratic speculation (`IDENT* ';' | IDENT` over 100,000 identifiers, 18 s in alpha.1) ran under any budget.
+- [x] **Grammar-proportional loops bounded or counted.** Contextual keyword operators are looked up from the owning rule instead of a scan of every rule; a choice's viability test, `try_alternatives`, memo chain walks, the predicate guard's walk, and replays charge ticks; error messages are built only when reported, and an expected set is described from at most seven members (a choice's own FIRST set, which a unit test checks is the union of its alternatives').
+- [x] Tests: `tests/limits.rs` (10), and parser unit tests and properties for cycle memoization, cyclic replay, replayed depth, stops agreeing memoized and unmemoized, the committed prefix after a stop, and choice FIRST sets.
+- [x] Benches `v2/parse/mox_arrays/50x200` and `v2/parse/mox_arrays/10000`.
+
+Dependency wiring: unchanged — `syntax-lang` 1, `diag-lang` 1.1, `pass-lang` 1, `unicode-lang` 1; no new dependencies. `ParseBudget` is a plain value type; nothing is serialized, and the image format is unchanged.
+
+Not in this release (recorded under the anti-deferral rule):
+- **The LSF2 items alpha.1 scheduled for alpha.2** (listed above) move to **v2.0.0-alpha.3**: this release was redefined as the security fix alone, so it ships without waiting on them. Nothing about them changed; each is still refused with `LSF1007`.
+- **The memo still lasts one outermost speculation.** Input whose every token starts a speculation that scans far ahead is quadratic (and stopped by the budget); a recovering predicate at every level of nesting rescans the levels below (bounded by the depth limit: at most about 2,000 steps a token in Mox). A memo kept for the whole parse would make both linear at the cost of memory proportional to the input times the rules tried; that is a design decision for 2.0, not a fix.
+- **The progress guard can still be exponential in grammar size** at one position (a cycle at the end of the input through `k` rules that all speculate); no result inside such a cycle depends only on its rule and position. The budget bounds it; `tests/limits.rs` holds a 40-rule instance to `LF9002`.
+- **The depth limit counts frames, not nesting.** Mox spends about 14 grammar levels per array literal, so 768 levels hold 53 of them; a language that needs more needs a cheaper grammar or a larger limit (the limit is what bounds the stack).
+
+## v2.0.0-alpha.3 - LSF2 completion (planned)
+- [ ] The items alpha.1 deferred (listed under alpha.1 above), moved here from alpha.2.
+
 ## v2.0.0 - API freeze (planned)
-- [ ] The alpha.2 items above.
+- [ ] The alpha.3 items above.
 - [ ] The format-2 surface reviewed and frozen; `docs/API.md` stability section updated to the 2.0 promise.
 
 ## Later candidates (additive)

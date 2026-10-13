@@ -54,6 +54,7 @@ pub struct Parse<'a> {
     tree: Node<Kind>,
     diagnostics: Vec<Diagnostic>,
     injections: Vec<Injection<'a>>,
+    steps: u64,
 }
 
 impl<'a> Parse<'a> {
@@ -63,6 +64,7 @@ impl<'a> Parse<'a> {
         tree: Node<Kind>,
         diagnostics: Vec<Diagnostic>,
         injections: Vec<Injection<'a>>,
+        steps: u64,
     ) -> Self {
         Self {
             language,
@@ -70,7 +72,34 @@ impl<'a> Parse<'a> {
             tree,
             diagnostics,
             injections,
+            steps,
         }
+    }
+
+    /// The steps the parser took, self-injections included, as the
+    /// [`ParseBudget`](crate::ParseBudget) counts them: a measure of the
+    /// parse's work that does not depend on the machine.
+    ///
+    /// A parse the budget stopped took its budget, give or take a step and
+    /// the cheap work (alternatives examined, events copied) that came with
+    /// it. A source of 4 GiB or more, which is not parsed, took none.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lang_forge::Language;
+    ///
+    /// let lang = Language::from_lsf("[language]\nname = \"n\"\n[rules]\nfile = \"item*\"\nitem = \"NUMBER\"\n")?;
+    /// let short = lang.parse("1 2").steps();
+    /// let long = lang.parse(&"1 ".repeat(1000)).steps();
+    /// // Linear in the input: two steps per item (the rule and its token), one for the repetition.
+    /// assert_eq!((short, long), (5, 2001));
+    /// # Ok::<(), lang_forge::Error>(())
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn steps(&self) -> u64 {
+        self.steps
     }
 
     /// The injections found in the source (format 2), in source order: the

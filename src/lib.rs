@@ -149,6 +149,14 @@
 //! reported and assumed, an unexpected token is reported and wrapped in an
 //! `ERROR` node, and the tree always covers the whole source.
 //!
+//! Parsing takes time linear in the input. Two limits stop a parse where it
+//! is: the depth limit (768 grammar levels, which bounds the stack) and a
+//! step budget proportional to the input ([`ParseBudget`], set per language
+//! with [`Language::with_parse_budget`]). Either one leaves the tree lossless,
+//! with the tokens not yet parsed in one `ERROR` node, and reports one
+//! diagnostic where the parse stopped; [`Parse::steps`] tells how much work a
+//! parse took.
+//!
 //! ## Features
 //!
 //! - `std` (default) — the standard library. Without it the crate is
@@ -162,7 +170,7 @@
 //!
 //! ## Stability
 //!
-//! This is `2.0.0-alpha.1`, a pre-release of the next major version. The
+//! This is `2.0.0-alpha.2`, a pre-release of the next major version. The
 //! format-1 surface and behaviour of 1.x are kept (format-1 sketches forge
 //! and parse exactly as before); the breaking changes are listed in the
 //! CHANGELOG with a migration guide. The format-2 surface may still change
@@ -190,6 +198,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod budget;
 mod codes;
 mod error;
 mod fields;
@@ -216,6 +225,7 @@ mod spec2;
 mod suggest;
 mod tree;
 
+pub use budget::ParseBudget;
 pub use error::Error;
 pub use fields::{Cardinality, Field};
 pub use image::{IMAGE_FORMAT, ImageError};
