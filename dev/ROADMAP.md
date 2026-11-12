@@ -1,7 +1,6 @@
 # lang-forge - Roadmap
 
 > Path from scaffold to a stable 1.0, then 2.0 (LSF2). Hard parts are front-loaded; each phase has hard exit criteria.
-> Master plan: ../../_strategy/LANG_COLLECTION.md
 >
 > **Anti-deferral rule:** no listed hard task moves to a later phase unless this file records the move and the reason.
 
@@ -110,7 +109,7 @@ Deferred to **v2.0.0-alpha.2** (each refused with `LSF1007` in alpha.1, never ig
 - **Spec follow-ups for `_lexersketch`:** codes used that LSF2 §27 does not list yet (`LSF1007` not supported, `LSF4112` rule syntax, `LSF4305`–`LSF4310` format-1 grammar checks, `LSF7004`/`LSF7005` pipeline); Mox's `elseif_clause` needs `allow = ["overlap"]` like `if_stmt`.
 
 ## v2.0.0-alpha.2 - Parser limits: linear time, a step budget (DONE, 2026-10-13)
-A security fix release, ahead of the LSF2 work alpha.1 scheduled here: past the depth limit, parsing time grew exponentially with each level of nesting (Mox: 56 nested array literals in the test copy of the sketch, 60 in the flagship, did not finish in 30 s; 65 `list(` calls took 77 s; LexerSketch hung). Scope set by the coordinator: make reaching the depth limit linear-time, audit every path the memo cannot cover, add an overall work budget (also serving `_lexersketch/ISSUES.md` P46, the Studio's forge timeout, on the parse side).
+A security fix release, ahead of the LSF2 work alpha.1 scheduled here: past the depth limit, parsing time grew exponentially with each level of nesting (Mox: 56 nested array literals in the test copy of the sketch, 60 in the flagship, did not finish in 30 s; 65 `list(` calls took 77 s; LexerSketch hung). Scope: make reaching the depth limit linear-time, audit every path the memo cannot cover, add an overall work budget (also serving `_lexersketch/ISSUES.md` P46, the Studio's forge timeout, on the parse side).
 
 Confirmed cause: `too_deep` failed the strict attempt that reached the limit and tainted it, so no result around it was memoized, and every retry point above it (each alternative, the item after a failed predicate, the operand after a failed lookahead such as Mox's `&(expr '=>')`) went down the same path again; instrumented, one level past the trip went from 16 to 327,600 limit hits and from 31 k to 7.8 M steps.
 
