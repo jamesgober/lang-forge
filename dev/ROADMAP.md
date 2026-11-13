@@ -139,11 +139,21 @@ Not in this release (recorded under the anti-deferral rule):
 - **The progress guard can still be exponential in grammar size** at one position (a cycle at the end of the input through `k` rules that all speculate); no result inside such a cycle depends only on its rule and position. The budget bounds it; `tests/limits.rs` holds a 40-rule instance to `LF9002`.
 - **The depth limit counts frames, not nesting.** Mox spends about 14 grammar levels per array literal, so 768 levels hold 53 of them; a language that needs more needs a cheaper grammar or a larger limit (the limit is what bounds the stack).
 
-## v2.0.0-alpha.3 - LSF2 completion (planned)
-- [ ] The items alpha.1 deferred (listed under alpha.1 above), moved here from alpha.2.
+## v2.0.0-alpha.3 - Lexer and forge limits (DONE, 2026-11-12)
+A fix release, like alpha.2: the format-2 lexer and the forge could be made to run far longer than their input warrants.
+- [x] **Lexing is linear in the input.** Maximal munch reran a token regex's automaton from every position, and a regex that reads far past the token taken (`-*b` over dashes) made lexing quadratic: 80,000 dashes took 6 s. The scanner now keeps a memo of `(position, state)` pairs each regex has passed, with the furthest accepting end reachable from each, so no run reads the same text in the same state twice (Reps, "Maximal-munch tokenization in linear time"). Kept lazily: a run is replayed into the memo only when a later run starts more than 32 bytes before the end of what it read, so ordinary input never fills it, and lexing speed on the Mox corpus is unchanged. Covers token classes, string-opener and closer parts, and embedded string tokens.
+- [x] **Forging has a time budget.** Determinization was capped in memory (states, cells, subset keys) but not in work: `a[^c1]?...[^c1000]?` (7 KB) forged in 35 s. Compiling the token regexes of one sketch now takes at most 8,388,608 steps in all (alphabet boundaries, NFA states, closure states, bucket pushes, classes examined), checked inside the loops, with `LSF3201`; the alphabet of one regex is capped at 256 symbols (was 4,096) and the NFA at 262,144 states (was 1,048,576). The Mox sketch takes about 21,000 steps.
+- [x] **A forged image count reserves no more than the image.** A count checked against an item's encoded minimum (1 byte) was reserved at its size in memory (32 bytes): 16 MiB of image reserved 512 MiB before it was refused.
+- [x] **`Parse::dump` is linear in the tree.** Indentation is capped at 64 levels; deeper lines show their depth as `[N] `.
+
+Not in this release:
+- **Deep trees still clone, compare, and print recursively.** An operator chain builds a tree as deep as the chain (the depth limit counts grammar levels, not tree levels), and the derived `Clone`, `PartialEq`, and `Debug` of `syntax_lang::Node` recurse, so a chain of 200,000 operators overflows the stack in `clone()`. The fix belongs in `syntax-lang` (iterative impls on `Node`).
+
+## v2.0.0-alpha.4 - LSF2 completion (planned)
+- [ ] The items alpha.1 deferred (listed under alpha.1 above), moved here from alpha.3.
 
 ## v2.0.0 - API freeze (planned)
-- [ ] The alpha.3 items above.
+- [ ] The alpha.4 items above.
 - [ ] The format-2 surface reviewed and frozen; `docs/API.md` stability section updated to the 2.0 promise.
 
 ## Later candidates (additive)

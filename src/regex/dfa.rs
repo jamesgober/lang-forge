@@ -46,6 +46,8 @@ const OFFSET: u32 = FINAL - 1;
 pub(crate) enum DfaError {
     /// The automaton grew past [`CELL_LIMIT`].
     TooLarge,
+    /// Building it would take more steps than the budget left.
+    TooCostly,
     /// Token `0` matches the empty string.
     EmptyMatch(u32),
     /// Token `token` never wins a match; `by` wins every string it matches
@@ -99,6 +101,25 @@ impl Dfa {
             return (0, 0);
         }
         (best_len, table[best_row].wrapping_sub(1))
+    }
+
+    /// The start row, where a scan begins.
+    #[inline]
+    pub(crate) fn start_row(&self) -> u32 {
+        self.start
+    }
+
+    /// One step of a scan: from `row` on `symbol`, the next row, whether it
+    /// accepts, and whether it is final (no way out but the dead state); or
+    /// `None` at the dead state, where a scan stops.
+    #[inline]
+    pub(crate) fn step(&self, row: u32, symbol: u16) -> Option<(u32, bool, bool)> {
+        let &column = self.columns.get(usize::from(symbol))?;
+        let next = self.table[row as usize + column as usize];
+        if next == 0 {
+            return None;
+        }
+        Some((next & OFFSET, next & ACCEPTING != 0, next & FINAL != 0))
     }
 
     /// Whether a transition leaves the start state on `symbol`.
@@ -168,9 +189,10 @@ pub(crate) fn build(
     matches: &[u32],
     max_subsets: usize,
     allow_empty: bool,
+    work: &mut u64,
 ) -> Result<Dfa, DfaError> {
     let (columns, classes) = symbol_classes(nfa);
-    let subsets = Subsets::build(nfa, classes, &columns, rank, max_subsets)?;
+    let subsets = Subsets::build(nfa, classes, &columns, rank, max_subsets, work)?;
 
     // A token in the start state's closure matches the empty string, which
     // would let the scanner stall without consuming input.
@@ -257,11 +279,13 @@ impl Subsets {
         columns: &[u16],
         rank: &[u32],
         max_subsets: usize,
+        work: &mut u64,
     ) -> Result<Self, DfaError> {
         let mut closure = Closure::new(nfa.states.len());
         let mut sets = SliceMap::new();
         let _ = sets.insert(&[]);
         let start_set = closure.of(nfa, &[nfa.start]);
+        spend(work, start_set.len())?;
         let (start, _) = sets.insert(start_set);
 
         let mut trans: Vec<u32> = Vec::new();
@@ -273,12 +297,17 @@ impl Subsets {
             key.clear();
             key.extend_from_slice(sets.get(id));
 
+            // Every bucket push, closure step, and class looked at counts
+            // against `work`, so a pattern that is small to write but costly
+            // to determinize stops in bounded time.
+            let mut cost = classes + key.len();
             let mut best: Option<u32> = None;
             for &s in &key {
                 match nfa.states[s as usize] {
                     State::Range { lo, hi, next } => {
                         let first = columns[lo as usize] as usize - 1;
                         let last = columns[hi as usize] as usize - 1;
+                        cost += last + 1 - first;
                         for bucket in &mut buckets[first..=last] {
                             bucket.push(next);
                         }
@@ -292,14 +321,18 @@ impl Subsets {
                 }
             }
             accept.push(best.map_or(0, |t| t + 1));
+            spend(work, cost)?;
 
             for bucket in &mut buckets {
                 let target = if bucket.is_empty() {
                     0
                 } else {
                     let set = closure.of(nfa, bucket);
+                    let len = set.len();
+                    let target = sets.insert(set).0;
                     bucket.clear();
-                    sets.insert(set).0
+                    spend(work, closure.steps + len)?;
+                    target
                 };
                 trans.push(target);
             }
@@ -327,6 +360,8 @@ struct Closure {
     generation: u32,
     stack: Vec<u32>,
     out: Vec<u32>,
+    /// The states the last call popped.
+    steps: usize,
 }
 
 impl Closure {
@@ -336,6 +371,7 @@ impl Closure {
             generation: 0,
             stack: Vec::new(),
             out: Vec::new(),
+            steps: 0,
         }
     }
 
@@ -347,8 +383,10 @@ impl Closure {
             self.generation = 1;
         }
         self.out.clear();
+        self.steps = 0;
         self.stack.extend_from_slice(seeds);
         while let Some(s) = self.stack.pop() {
+            self.steps += 1;
             let slot = &mut self.stamp[s as usize];
             if *slot == self.generation {
                 continue;
@@ -361,6 +399,20 @@ impl Closure {
         }
         self.out.sort_unstable();
         &self.out
+    }
+}
+
+/// Takes `steps` from the budget `work`, or fails if it does not hold them.
+fn spend(work: &mut u64, steps: usize) -> Result<(), DfaError> {
+    match work.checked_sub(steps as u64) {
+        Some(left) => {
+            *work = left;
+            Ok(())
+        }
+        None => {
+            *work = 0;
+            Err(DfaError::TooCostly)
+        }
     }
 }
 

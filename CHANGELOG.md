@@ -13,6 +13,58 @@
 
 ---
 
+## [2.0.0-alpha.3] - 2026-11-12
+
+A fix release for the format-2 lexer and the forge. Both could be made to run
+far longer than their input warrants, which matters to any editor or service
+that lexes untrusted text or forges sketches it did not write.
+
+### Fixed
+
+- **Lexing is linear in the input.** The scanner reran a token regex from
+  every position, and a regex that reads far past the token the lexer then
+  takes made lexing quadratic: with `T = { regex = '-*b' }` and
+  `U = { literal = "-" }`, 80,000 dashes took 6 s, and 1 MB would have taken
+  about a quarter of an hour. The scanner now remembers, for each regex, the
+  `(position, state)` pairs its runs passed and how far a run from each one
+  reaches, so no run reads the same text in the same state twice. 400,000
+  dashes now lex in milliseconds. This covers token classes, the regex parts
+  of string openers and closers, and embedded string tokens. Ordinary input
+  never fills the memo, and lexing speed on the Mox corpus is unchanged.
+- **Forging is bounded in time, not only in memory.** Determinizing a regex
+  was capped in states and table size but not in work, so a short pattern
+  could take very long: `a[^c1]?[^c2]?...[^c1000]?` (7 KB) forged in 35 s,
+  and `((x?){1000}){400}` took about a second to be refused. Compiling the
+  token regexes of one sketch now takes at most 8,388,608 steps in all,
+  counted inside the construction loops, and is refused past that with
+  `LSF3201`. Both patterns are now refused in milliseconds.
+- **Loading a forged language image reserves no more than the image.** An
+  element count was checked against its smallest encoding (one byte) and then
+  reserved at its size in memory, so a 16 MiB image reserved 512 MiB before it
+  was refused.
+- **`Parse::dump` is linear in the tree.** Every level was indented, so a
+  16 KB operator chain dumped 193 MB.
+
+### Changed
+
+- One token regex may tell at most 256 sets of characters apart (4,096
+  before), and its NFA may have at most 262,144 states (1,048,576 before).
+  Past either, the regex is refused with `LSF3201`. The token regexes of the
+  example sketches and the Mox sketch are far inside both.
+- `Parse::dump` indents at most 64 levels. A deeper line keeps that indent
+  and starts with its depth in brackets, such as `[65] `. Trees no deeper
+  than 64 levels dump exactly as before.
+
+### Migration guide
+
+1. Change `lang-forge = "2.0.0-alpha.2"` to `lang-forge = "2.0.0-alpha.3"`.
+2. A sketch whose regexes forged in alpha.2 but meet the new limits is
+   refused with `LSF3201`; split the regex or simplify its classes.
+3. Snapshot tests of `Parse::dump` on trees deeper than 64 levels need
+   updating.
+
+---
+
 ## [2.0.0-alpha.2] - 2026-10-13
 
 A security fix: past the parser's depth limit, parsing time grew
@@ -494,7 +546,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/lang-forge/compare/v2.0.0-alpha.2...HEAD
+[Unreleased]: https://github.com/jamesgober/lang-forge/compare/v2.0.0-alpha.3...HEAD
+[2.0.0-alpha.3]: https://github.com/jamesgober/lang-forge/compare/v2.0.0-alpha.2...v2.0.0-alpha.3
 [2.0.0-alpha.2]: https://github.com/jamesgober/lang-forge/compare/v2.0.0-alpha.1...v2.0.0-alpha.2
 [2.0.0-alpha.1]: https://github.com/jamesgober/lang-forge/compare/v1.0.1...v2.0.0-alpha.1
 [1.0.1]: https://github.com/jamesgober/lang-forge/compare/v1.0.0...v1.0.1

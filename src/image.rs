@@ -276,7 +276,12 @@ impl<T: Image> Image for Vec<T> {
     }
     fn get(r: &mut Reader<'_>) -> Res<Self> {
         let n = r.len(T::MIN)?;
-        let mut out = Vec::with_capacity(n);
+        // `n` is checked against the bytes left at each item's encoded
+        // minimum, which can be far below its size in memory; reserve no
+        // more than the bytes left would hold, so a forged count cannot make
+        // the reservation outgrow the image.
+        let fits = r.left() / core::mem::size_of::<T>().max(1);
+        let mut out = Vec::with_capacity(n.min(fits.max(1)));
         for _ in 0..n {
             out.push(T::get(r)?);
         }

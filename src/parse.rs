@@ -8,6 +8,9 @@ use syntax_lang::{Element, Node, Span};
 
 use crate::{Language, kind::Kind};
 
+/// The most levels [`Parse::dump`] indents; deeper lines show their depth.
+const DUMP_INDENT: usize = 64;
+
 /// The result of [`Language::parse`]: a lossless syntax tree and the problems
 /// found while building it.
 ///
@@ -264,6 +267,11 @@ impl<'a> Parse<'a> {
     /// The tree as indented text, one node or token per line: each line is a
     /// kind name and a byte range, and each token also shows its text.
     ///
+    /// Each level indents two spaces, up to 64 levels. A line deeper than
+    /// that keeps the 64-level indent and starts with its depth in brackets,
+    /// such as `[65] `, so the text stays linear in the size of the tree
+    /// however deep it is.
+    ///
     /// Meant for tests, snapshots, and debugging a grammar. The format is
     /// stable within a major version.
     ///
@@ -293,8 +301,12 @@ impl<'a> Parse<'a> {
         let mut out = String::new();
         let mut stack: Vec<(&Element<Kind>, usize)> = Vec::new();
         let line = |out: &mut String, depth: usize, kind: Kind, start: u32, end: u32| {
-            for _ in 0..depth {
+            for _ in 0..depth.min(DUMP_INDENT) {
                 out.push_str("  ");
+            }
+            if depth > DUMP_INDENT {
+                // Writing to a `String` cannot fail.
+                let _ = write!(out, "[{depth}] ");
             }
             // A field label (format 2) prefixes the element it labels.
             if let Some(label) = kind.label().and_then(|l| self.language.label_name(l)) {

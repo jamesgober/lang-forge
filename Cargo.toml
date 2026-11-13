@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "lang-forge"
-version = "2.0.0-alpha.2"
+version = "2.0.0-alpha.3"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"

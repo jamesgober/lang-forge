@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, no dependencies outside the <code>-lang</code> family.
     </p>
     <blockquote>
-        <strong>2.0.0-alpha.2 is a pre-release of 2.0.</strong> It fixes a denial of service in alpha.1: input nested past the parser's depth limit, such as sixty nested array literals in Mox, never finished parsing. The depth limit now stops the parse in linear time with one located diagnostic, and a step budget proportional to the input bounds every parse. The 2.0 line adds LSF2, the format-2 sketch syntax (token classes, lexer modes, interpolated strings and heredocs, contextual keywords, layout, labelled fields, predicates, injections), multi-file sketches, language images, and diagnostic codes. A format-1 schematic forges and parses exactly as in 1.x. The breaking changes are small and listed with a migration guide in <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>; the format-2 surface may still change before <code>2.0.0</code>. See <a href="./docs/API.md#stability"><code>docs/API.md</code></a>.
+        <strong>2.0.0-alpha.3 is a pre-release of 2.0.</strong> It makes lexing linear in the input (a token regex that reads far past its token made the format-2 lexer quadratic) and holds forging to a time budget as well as a memory one. Alpha.2 made the parser's limits stop a parse in linear time. The 2.0 line adds LSF2, the format-2 sketch syntax (token classes, lexer modes, interpolated strings and heredocs, contextual keywords, layout, labelled fields, predicates, injections), multi-file sketches, language images, and diagnostic codes. A format-1 schematic forges and parses exactly as in 1.x. The breaking changes are small and listed with a migration guide in <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>; the format-2 surface may still change before <code>2.0.0</code>. See <a href="./docs/API.md#stability"><code>docs/API.md</code></a>.
     </blockquote>
 </div>
 
@@ -56,11 +56,11 @@ What the crate guarantees:
 | Guarantee | How it is held |
 |---|---|
 | Parsing never fails, never panics, and never overflows the stack. | Recovery is built into the parser. Recursion is bounded at 768 grammar levels — at most about 256 KiB of stack in release builds, 768 KiB in debug — and deeper input is reported, not followed. Property tests throw random text and token soup at every example language. |
-| Parsing takes time linear in the input, and a hostile grammar or input ends with an error, not a hang. | Input past the depth limit stops the parse at once, with one `LF1003` diagnostic where the limit was reached; a step budget proportional to the input (`ParseBudget`, configurable) stops anything else that would run on, with `LF9002`. The tree stays lossless either way. [`tests/limits.rs`](./tests/limits.rs) holds nesting from 50 to 10,000 levels, and random nesting, to a step count per token. |
+| Lexing and parsing take time linear in the input, and a hostile grammar or input ends with an error, not a hang. | The lexer remembers how each token regex's runs ended, so no run reads the same text in the same state twice. Input past the depth limit stops the parse at once, with one `LF1003` diagnostic where the limit was reached; a step budget proportional to the input (`ParseBudget`, configurable) stops anything else that would run on, with `LF9002`. The tree stays lossless either way. [`tests/limits.rs`](./tests/limits.rs) holds nesting from 50 to 10,000 levels, and random nesting, to a step count per token, and lexes 400,000-byte runs that a token regex reads to the end. |
 | Every tree is lossless: it covers every byte of the source, whitespace and comments included. | Tested on every parse in the suite, and as a property over arbitrary input. |
 | On input without errors, the tree is the one the grammar describes. | A strict reference parser runs in the tests; whenever the recovering parser reports no error, the two trees must be identical. |
 | A schematic the parser could not run is refused when it is forged. | Left recursion, repetitions that could loop forever, unreachable alternatives, and literals the lexer cannot produce are all errors, with the rule and the fix named. |
-| Forging a hostile schematic takes bounded memory. | The schematic's size (8 MiB), nesting (64 levels), and the tables that grow with rules times token kinds (256 MiB) are capped, and checked before anything that size is allocated. A counting allocator in [`tests/memory.rs`](./tests/memory.rs) measures it. Format 2 adds budgets on regex automata, lexer modes (and the mode stack at run time), labels, and suggestion work. |
+| Forging a hostile schematic takes bounded memory and time. | The schematic's size (8 MiB), nesting (64 levels), and the tables that grow with rules times token kinds (256 MiB) are capped, and checked before anything that size is allocated. A counting allocator in [`tests/memory.rs`](./tests/memory.rs) measures it. Format 2 adds budgets on regex automata, lexer modes (and the mode stack at run time), labels, and suggestion work. Compiling the token regexes of one sketch may take 8,388,608 steps in all (the Mox sketch takes about 21,000), and one regex may tell at most 256 sets of characters apart, so a short pattern that is costly to compile is refused in milliseconds. |
 | A format-1 schematic means what it meant in 1.x. | The format-1 reader is the 1.x reader, unchanged; the 1.x test suite runs against it. |
 | A greedy repetition never silently rejects valid input (format 2). | The LL(2) overlap check refuses it with a witness input (`LSF4301`), unless the rule acknowledges it. |
 | Loading a language image never panics. | Every index and length in an image is checked before use; property tests load thousands of mutated images and parse with whatever loads. |
@@ -72,7 +72,7 @@ What the crate guarantees:
 
 ```toml
 [dependencies]
-lang-forge = "2.0.0-alpha.2"
+lang-forge = "2.0.0-alpha.3"
 ```
 
 Or from the terminal:

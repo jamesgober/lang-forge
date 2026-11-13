@@ -146,3 +146,43 @@ fn test_large_keyword_grammar_forges_within_the_table_budget() {
     assert!(!lang.parse("k12345 z").has_errors());
     assert!(bytes < 256 * MIB, "{} MiB", bytes / MIB);
 }
+
+/// FNV-1a, the image body's checksum.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+#[test]
+fn test_forged_image_count_reserves_no_more_than_the_image() {
+    // A count of capabilities as large as the bytes after it, each of which
+    // encodes in a byte at least but is far larger in memory. Loading fails;
+    // it used to reserve 32 times the image first. What it holds now is the
+    // items it decodes before the error, a small multiple of the image.
+    let pad = 4usize << 20;
+    let mut body = Vec::with_capacity(pad + 32);
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.push(b'x'); // name "x"
+    body.push(0); // no version
+    body.extend_from_slice(&0u32.to_le_bytes()); // no extensions
+    body.extend_from_slice(&(pad as u32).to_le_bytes()); // capabilities
+    body.resize(body.len() + pad, 0);
+    let mut image = Vec::new();
+    image.extend_from_slice(b"LSL\0");
+    image.extend_from_slice(&1u16.to_le_bytes());
+    image.extend_from_slice(&0u16.to_le_bytes());
+    image.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    image.extend_from_slice(&fnv1a(&body).to_le_bytes());
+    image.extend_from_slice(&body);
+    let (result, used) = peak(|| Language::from_image(&image).is_err());
+    assert!(result, "a forged image is refused");
+    assert!(
+        used <= 8 * image.len(),
+        "{used} bytes to refuse an image of {}",
+        image.len()
+    );
+}

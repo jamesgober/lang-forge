@@ -63,13 +63,36 @@ pub(crate) struct PatternError {
 pub(crate) const UNSUPPORTED_PROPERTY: &str =
     "this Unicode property is not available; supported: XID_Start, XID_Continue";
 
+/// The most steps compiling every token regex of one forge may take
+/// together: alphabet boundaries, NFA states built, and determinization steps
+/// (closure states, bucket pushes, classes looked at). The Mox sketch takes
+/// about 21,000, so this leaves a margin of about 400; at a few nanoseconds a
+/// step, a forge that uses all of it is still quick.
+pub(crate) const FORGE_WORK: u64 = 1 << 23;
+
 /// The Unicode identifier properties, as ranges, computed when first needed,
-/// and the patterns compiled so far in one forge.
-#[derive(Default)]
+/// the patterns compiled so far in one forge, and the steps compiling them
+/// may still take.
 pub(crate) struct Props {
     xid_start: Option<Box<[(u32, u32)]>>,
     xid_continue: Option<Box<[(u32, u32)]>>,
     compiled: alloc::collections::BTreeMap<(alloc::string::String, bool), super::Regex>,
+    /// Steps left of [`FORGE_WORK`].
+    pub(crate) work: u64,
+    /// Whether running out of `work` has been reported.
+    pub(crate) spent_reported: bool,
+}
+
+impl Default for Props {
+    fn default() -> Self {
+        Self {
+            xid_start: None,
+            xid_continue: None,
+            compiled: alloc::collections::BTreeMap::new(),
+            work: FORGE_WORK,
+            spent_reported: false,
+        }
+    }
 }
 
 impl Props {

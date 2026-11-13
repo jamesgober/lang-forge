@@ -19,6 +19,7 @@
 //! alphabet's ranges.
 
 mod dfa;
+pub(crate) mod memo;
 mod nfa;
 pub(crate) mod parse;
 mod slicemap;
@@ -26,16 +27,23 @@ mod slicemap;
 use alloc::{boxed::Box, collections::BTreeMap, vec, vec::Vec};
 
 pub(crate) use dfa::Dfa;
-pub(crate) use parse::{Hir, Props, UNSUPPORTED_PROPERTY};
+pub(crate) use memo::Memo;
+pub(crate) use parse::{FORGE_WORK, Hir, Props, UNSUPPORTED_PROPERTY};
 
-/// The most symbols one pattern's alphabet may have.
-const MAX_SYMBOLS: usize = 4096;
+/// The most symbols one pattern's alphabet may have. Each symbol is a column
+/// of the automaton and a bucket of every determinization step, so this also
+/// bounds the cost of a pattern written as many distinct classes.
+pub(crate) const MAX_SYMBOLS: usize = 256;
 
 /// Why a pattern could not be compiled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompileError {
     /// The automaton (or its alphabet) is larger than allowed.
     TooLarge,
+    /// The pattern's alphabet has more than [`MAX_SYMBOLS`] symbols.
+    TooManyClasses,
+    /// Building the automaton would take more steps than the budget left.
+    TooCostly,
     /// The pattern matches the empty string.
     Empty,
 }
@@ -100,7 +108,7 @@ type ClassRuns<'h> = BTreeMap<&'h [(u32, u32)], Vec<(u16, u16)>>;
 /// Computes the alphabet of `hir`: one symbol per distinct set of the
 /// pattern's classes a character belongs to (symbol 0 for none), and, for
 /// each class, the runs of symbols it contains.
-fn alphabet(hir: &Hir) -> Result<(Alphabet, ClassRuns<'_>), CompileError> {
+fn alphabet<'h>(hir: &'h Hir, work: &mut u64) -> Result<(Alphabet, ClassRuns<'h>), CompileError> {
     // The distinct classes, numbered.
     let mut classes: BTreeMap<&[(u32, u32)], u32> = BTreeMap::new();
     let mut stack = vec![hir];
@@ -125,6 +133,9 @@ fn alphabet(hir: &Hir) -> Result<(Alphabet, ClassRuns<'_>), CompileError> {
         }
     }
     events.sort_unstable();
+    // Each boundary costs a look at the membership words.
+    let cost = (events.len() as u64).saturating_mul(words as u64 + 1);
+    *work = work.checked_sub(cost).ok_or(CompileError::TooCostly)?;
     let mut member = vec![0u64; words];
     let mut symbols: BTreeMap<Vec<u64>, u16> = BTreeMap::new();
     let _ = symbols.insert(vec![0u64; words], 0);
@@ -150,7 +161,7 @@ fn alphabet(hir: &Hir) -> Result<(Alphabet, ClassRuns<'_>), CompileError> {
         let next = symbols.len() as u16;
         let symbol = *symbols.entry(member.clone()).or_insert(next);
         if symbols.len() > MAX_SYMBOLS {
-            return Err(CompileError::TooLarge);
+            return Err(CompileError::TooManyClasses);
         }
         if symbol != 0 {
             match intervals.last_mut() {
@@ -210,23 +221,47 @@ pub(crate) struct Regex {
 }
 
 impl Regex {
-    /// Compiles `hir` into an automaton of at most `max_states` states. A
-    /// pattern that matches the empty string is refused.
-    pub(crate) fn compile(hir: &Hir, max_states: usize) -> Result<Self, CompileError> {
-        Self::build(hir, max_states, false)
+    /// Compiles `hir` into an automaton of at most `max_states` states,
+    /// taking the steps that needs from `work`. A pattern that matches the
+    /// empty string is refused.
+    pub(crate) fn compile(
+        hir: &Hir,
+        max_states: usize,
+        work: &mut u64,
+    ) -> Result<Self, CompileError> {
+        Self::build(hir, max_states, false, work)
     }
 
     /// Compiles a delimiter part's pattern, which may match the empty string
     /// (`[ \t]*`): see [`matches_empty`](Self::matches_empty).
-    pub(crate) fn compile_part(hir: &Hir, max_states: usize) -> Result<Self, CompileError> {
-        Self::build(hir, max_states, true)
+    pub(crate) fn compile_part(
+        hir: &Hir,
+        max_states: usize,
+        work: &mut u64,
+    ) -> Result<Self, CompileError> {
+        Self::build(hir, max_states, true, work)
     }
 
-    fn build(hir: &Hir, max_states: usize, allow_empty: bool) -> Result<Self, CompileError> {
-        let (alphabet, runs) = alphabet(hir)?;
-        let mut builder = nfa::Builder::new(&runs);
-        let accept = builder.add(hir, 0).map_err(|_| CompileError::TooLarge)?;
-        let nfa = builder.finish().map_err(|_| CompileError::TooLarge)?;
+    fn build(
+        hir: &Hir,
+        max_states: usize,
+        allow_empty: bool,
+        work: &mut u64,
+    ) -> Result<Self, CompileError> {
+        let (alphabet, runs) = alphabet(hir, work)?;
+        // The NFA's states count against `work` too; a builder that would
+        // make more than it holds stops early.
+        let mut builder = nfa::Builder::new(&runs).with_limit(*work);
+        let accept = builder.add(hir, 0);
+        let nfa = accept.and_then(|_| builder.finish());
+        let (Ok(accept), Ok(nfa)) = (accept, nfa) else {
+            return Err(if *work <= nfa::STATE_LIMIT as u64 {
+                CompileError::TooCostly
+            } else {
+                CompileError::TooLarge
+            });
+        };
+        *work -= nfa.states.len() as u64;
         // Subset construction may need a few times the minimal state count.
         let dfa = dfa::build(
             &nfa,
@@ -235,9 +270,11 @@ impl Regex {
             &[accept],
             max_states.saturating_mul(4),
             allow_empty,
+            work,
         )
         .map_err(|e| match e {
             dfa::DfaError::TooLarge => CompileError::TooLarge,
+            dfa::DfaError::TooCostly => CompileError::TooCostly,
             // With one token, "never wins" can only mean "matches nothing
             // at all", which a parsed pattern cannot; refuse it the same.
             dfa::DfaError::EmptyMatch(_) | dfa::DfaError::Shadowed { .. } => CompileError::Empty,
@@ -305,7 +342,7 @@ impl Regex {
     /// The length of the longest match at the start of `text`, or `None` if
     /// the pattern matches no prefix (a pattern that matches the empty string
     /// always matches).
-    #[inline]
+    #[cfg(test)]
     pub(crate) fn match_len(&self, text: &str) -> Option<usize> {
         match self.longest_match(text) {
             0 if self.matches_empty() => Some(0),
@@ -339,6 +376,140 @@ impl Regex {
                     .0
             }
             _ => 0,
+        }
+    }
+}
+
+impl Regex {
+    /// The length in bytes of the longest match at byte position `at` of
+    /// `src`, reading no further than `end`, or 0. Runs share what they learn
+    /// through `memo`, so scanning a whole text this way takes time linear in
+    /// it, however far past a token the automaton has to look. Every call
+    /// with one memo must pass the same `src` and `end`.
+    ///
+    /// The first [`memo::SLACK`] bytes of a run are read without the memo: a
+    /// run that ends that soon is all an ordinary token needs, and reading
+    /// that much again costs a bounded amount per run.
+    #[inline]
+    pub(crate) fn longest_match_at<'a>(
+        &'a self,
+        src: &str,
+        at: usize,
+        end: usize,
+        memo: &mut Memo<'a>,
+    ) -> usize {
+        let text = &src[at..end];
+        let Some(&lead) = text.as_bytes().first() else {
+            return 0;
+        };
+        if !self.can_start(lead) && !self.matches_empty() {
+            return 0;
+        }
+        let mut chars = text.chars();
+        let mut row = self.dfa.start_row();
+        let mut best: usize = 0;
+        let mut pos = at;
+        let near = at + memo::SLACK;
+        loop {
+            let step = chars
+                .next()
+                .and_then(|c| Some((c, self.dfa.step(row, self.alphabet.symbol(c))?)));
+            let Some((c, (next, accepting, last))) = step else {
+                memo.count(pos - at);
+                return best.saturating_sub(at);
+            };
+            pos += c.len_utf8();
+            row = next;
+            if accepting {
+                best = pos;
+                if last {
+                    memo.count(pos - at);
+                    return best - at;
+                }
+            }
+            if pos > near {
+                break;
+            }
+        }
+        // A long run: from here on, use and feed the memo.
+        memo.count(pos - at);
+        memo.begin(at, src, end);
+        let id = self.id();
+        let mut kept = pos;
+        if let Some(further) = memo.get(id, pos, row) {
+            best = best.max(further);
+        } else {
+            for c in chars {
+                let Some((next, accepting, last)) = self.dfa.step(row, self.alphabet.symbol(c))
+                else {
+                    break;
+                };
+                memo.count(c.len_utf8());
+                pos += c.len_utf8();
+                row = next;
+                if accepting {
+                    best = pos;
+                    if last {
+                        break;
+                    }
+                }
+                if let Some(further) = memo.get(id, pos, row) {
+                    best = best.max(further);
+                    break;
+                }
+                kept = pos;
+            }
+        }
+        memo.finish(self, at, kept, best);
+        best.saturating_sub(at)
+    }
+
+    /// [`match_len`](Self::match_len) at byte position `at` of `src`, with a
+    /// memo: see [`longest_match_at`](Self::longest_match_at).
+    #[inline]
+    pub(crate) fn match_len_at<'a>(
+        &'a self,
+        src: &str,
+        at: usize,
+        end: usize,
+        memo: &mut Memo<'a>,
+    ) -> Option<usize> {
+        match self.longest_match_at(src, at, end, memo) {
+            0 if self.matches_empty() => Some(0),
+            0 => None,
+            n => Some(n),
+        }
+    }
+
+    /// This pattern's identity in a memo: its address, which no other
+    /// pattern alive at the same time shares.
+    #[inline]
+    fn id(&self) -> usize {
+        core::ptr::from_ref(self) as usize
+    }
+
+    /// Runs a scan from `from` again, up to `last`, calling `visit` with each
+    /// position and row it passes: how a memo keeps a finished run.
+    fn replay(
+        &self,
+        src: &str,
+        from: usize,
+        end: usize,
+        last: usize,
+        mut visit: impl FnMut(usize, u32),
+    ) {
+        let mut row = self.dfa.start_row();
+        let mut pos = from;
+        for c in src[from..end].chars() {
+            if pos >= last {
+                break;
+            }
+            let Some((next, _, _)) = self.dfa.step(row, self.alphabet.symbol(c)) else {
+                break;
+            };
+            pos += c.len_utf8();
+            row = next;
+            visit(pos, row);
         }
     }
 }
@@ -429,7 +600,88 @@ mod tests {
 
     fn regex(p: &str) -> Regex {
         let hir = parse::parse(p, &mut Props::default()).unwrap();
-        Regex::compile(&hir, 4096).unwrap()
+        Regex::compile(&hir, 4096, &mut { u64::MAX }).unwrap()
+    }
+
+    /// A small deterministic generator for the property tests below.
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state >> 33
+    }
+
+    #[test]
+    fn test_longest_match_at_agrees_with_a_fresh_run() {
+        let patterns = [
+            "-*b",
+            "(--)*b|-(--)*x",
+            "a(ba)*c?",
+            "[a-c]*d|ab",
+            "-+",
+            "(ab|a)(bc|c)*x?",
+            "é+-?b",
+        ];
+        let regexes: Vec<Regex> = patterns.iter().map(|p| regex(p)).collect();
+        let pieces = ["-", "b", "x", "a", "c", "d", "é", "ba", "bc"];
+        let mut seed = 7;
+        // Long repeated pieces, so runs read well past the next start, which
+        // is when the memo keeps what they read.
+        for _ in 0..150 {
+            let mut text = alloc::string::String::new();
+            for _ in 0..lcg(&mut seed) % 12 {
+                let piece = pieces[(lcg(&mut seed) % pieces.len() as u64) as usize];
+                let times = 1 + (lcg(&mut seed) % 40) as usize;
+                text.push_str(&piece.repeat(times));
+            }
+            let starts: Vec<usize> = (0..text.len())
+                .filter(|&i| text.is_char_boundary(i))
+                .collect();
+            let mut memo = Memo::default();
+            // Mostly forward, as a scan goes, with a jump back now and then.
+            let mut k = 0;
+            while k < starts.len() {
+                let at = starts[k];
+                for r in &regexes {
+                    let fresh = r.longest_match(&text[at..]);
+                    assert_eq!(
+                        r.longest_match_at(&text, at, text.len(), &mut memo),
+                        fresh,
+                        "{text:?} at {at}"
+                    );
+                }
+                k = if lcg(&mut seed) % 7 == 0 {
+                    k.saturating_sub(3)
+                } else {
+                    k + 1 + (lcg(&mut seed) % 2) as usize
+                };
+            }
+        }
+    }
+
+    #[test]
+    fn test_longest_match_at_reads_each_character_a_bounded_number_of_times() {
+        // `-*b` over dashes with no `b` runs to the end from every start; the
+        // memo makes the later runs stop soon. The second pattern's state
+        // depends on the parity of the dashes read, so its first two runs
+        // read to the end. A scan without memory reads n / 2 bytes a dash.
+        let dashes = regex("-*b");
+        let parity = regex("(--)*b|-(--)*x");
+        for n in [1_000usize, 4_000, 16_000] {
+            let text = "-".repeat(n);
+            let mut memo = Memo::default();
+            for at in 0..n {
+                assert_eq!(dashes.longest_match_at(&text, at, n, &mut memo), 0);
+                assert_eq!(parity.longest_match_at(&text, at, n, &mut memo), 0);
+            }
+            // Each run reads up to `SLACK` bytes before it looks at the memo.
+            let per_dash = 2 * (memo::SLACK as u64 + 8);
+            assert!(
+                memo.steps <= per_dash * n as u64,
+                "n = {n}: {} bytes read",
+                memo.steps
+            );
+        }
     }
 
     #[test]
@@ -472,7 +724,7 @@ mod tests {
     #[test]
     fn test_parts_may_match_empty() {
         let hir = parse::parse("[ \t]*", &mut Props::default()).unwrap();
-        let part = Regex::compile_part(&hir, 4096).unwrap();
+        let part = Regex::compile_part(&hir, 4096, &mut { u64::MAX }).unwrap();
         assert!(part.matches_empty());
         assert_eq!(part.match_len("x"), Some(0));
         assert_eq!(part.match_len("  \tx"), Some(3));
@@ -485,10 +737,13 @@ mod tests {
     #[test]
     fn test_compile_errors() {
         let hir = parse::parse("a*", &mut Props::default()).unwrap();
-        assert_eq!(Regex::compile(&hir, 4096).unwrap_err(), CompileError::Empty);
+        assert_eq!(
+            Regex::compile(&hir, 4096, &mut { u64::MAX }).unwrap_err(),
+            CompileError::Empty
+        );
         let hir = parse::parse("(a|b)*a(a|b){12}", &mut Props::default()).unwrap();
         assert_eq!(
-            Regex::compile(&hir, 4096).unwrap_err(),
+            Regex::compile(&hir, 4096, &mut { u64::MAX }).unwrap_err(),
             CompileError::TooLarge
         );
     }
