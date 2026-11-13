@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "LexerSketch: forge a working language front end - lexer, parser, and lossless syntax tree - from a .lsf schematic."
+description = "Forge a working language front end - lexer, parser, and lossless syntax tree - from a .lsf schematic."
 
 # Keywords (5 max)
 keywords = ["language", "generator", "parser", "compiler", "dsl"]
@@ -55,7 +55,7 @@ std = ["syntax-lang/std", "diag-lang/std", "pass-lang/std"]
 # The family's lossless concrete syntax tree. A forged language parses into a
 # `syntax_lang::Node`, the tree the family's formatter, incremental reparser,
 # language server, and tree-sitter crates are designed to consume (the adapters
-# that connect them arrive with LexerSketch).
+# that connect them arrive with the toolchain).
 syntax-lang = { version = "1", default-features = false }
 # Diagnostics. Schematic errors and parse errors are `diag_lang::Diagnostic`s
 # with labelled spans, rendered with source context by `diag_lang::Renderer`.

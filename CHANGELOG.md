@@ -71,7 +71,7 @@ A security fix: past the parser's depth limit, parsing time grew
 exponentially with every level of nesting, a denial of service in any editor
 or service that parses untrusted text. Nested array literals in Mox
 (`<?mox $x = [[[…1…]]];`) parsed in about 80 ms at fifty levels (a debug
-build of LexerSketch) and did not finish at sixty; sixty-five nested `list(`
+build of the toolchain) and did not finish at sixty; sixty-five nested `list(`
 calls took 77 s, and more did not finish. The depth limit now stops the parse
 in time linear in the input, and every parse is held to a step budget
 proportional to its input.
@@ -171,7 +171,7 @@ proportional to its input.
 
 ## [2.0.0-alpha.1] - 2026-10-09
 
-The first pre-release of 2.0: LSF2, LexerSketch's format-2 sketch syntax, as
+The first pre-release of 2.0: LSF2, the toolchain's format-2 sketch syntax, as
 the front end for the Mox demo (ROADMAP work package 2.1). A format-1
 schematic — no `[sketch]` table, or `[sketch] format = 1` — forges and parses
 exactly as in 1.x: the format-1 reader is unchanged and the whole 1.x test
@@ -321,7 +321,7 @@ To move a schematic to format 2 (LSF2 §2.3):
 
 ### Notes
 
-- Mox's sketch (`_lexersketch/sketches/mox.lsf`) has one more divergence
+- Mox's sketch (the Mox sketch) has one more divergence
   than it acknowledges: `elseif_clause`'s optional `else:` (the same case as
   `if_stmt`, which says `allow = ["overlap"]`). The test copy in
   `tests/sketches/mox.lsf` adds the same allowance; the flagship sketch
@@ -344,7 +344,7 @@ To move a schematic to format 2 (LSF2 §2.3):
 
 ## [1.0.1] - 2026-10-08
 
-A hardening patch from the LexerSketch audit. No public API changes; the
+A hardening patch from the toolchain's audit. No public API changes; the
 `.lsf` format is unchanged. Some schematics 1.0.0 forged are now refused:
 each is invalid NOML or hostile, and each is listed below.
 
@@ -382,7 +382,7 @@ each is invalid NOML or hostile, and each is listed below.
   docs and README said forged trees "plug straight into" the formatter,
   incremental reparser, language server, and tree-sitter crates — they are
   trees those crates are designed to consume, and the adapters arrive with
-  LexerSketch; `dev/ROADMAP.md`'s note on `grammar-lang` was out of date.
+  the toolchain; `dev/ROADMAP.md`'s note on `grammar-lang` was out of date.
 
 ### Security
 
@@ -448,7 +448,7 @@ is a lint fix for newer Clippy.
 
 ## [0.2.0] - 2026-10-07
 
-The core: LexerSketch forges a working language front end from a `.lsf`
+The core: the toolchain forges a working language front end from a `.lsf`
 schematic — a derived lexer, an interpreted parser with error recovery, and
 lossless `syntax-lang` trees — and wires the schematic's capabilities into a
 `pass-lang` pipeline.

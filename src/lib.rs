@@ -1,6 +1,6 @@
 //! # lang_forge
 //!
-//! LexerSketch: forge a working language front end — lexer, parser, and
+//! Forge a working language front end — lexer, parser, and
 //! lossless syntax tree — from a `.lsf` schematic.
 //!
 //! A schematic is a short NOML document that describes a language: its name,
@@ -15,7 +15,7 @@
 //! trees are `syntax-lang` trees, the family's lossless CST, which the
 //! formatter, incremental reparser, language server, and tree-sitter crates
 //! are designed to consume; the adapters that connect a forged language to
-//! those crates are not part of lang-forge and arrive with LexerSketch. Its
+//! those crates are not part of lang-forge and arrive with the toolchain. Its
 //! diagnostics render with `diag-lang`, and its capabilities run on
 //! `pass-lang`.
 //!

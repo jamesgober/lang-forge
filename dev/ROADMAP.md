@@ -10,7 +10,7 @@ Compiles, CI green, structure correct, no domain logic.
 - [x] Scaffold defects fixed at the start of v0.2.0: unquoted `keywords`/`categories` (the manifest did not parse), clippy MSRV 1.87 vs 1.85, `deny.toml` naming another project, byte-order marks in two docs, a README link to a missing `dev/DIRECTIVES.md`, and the REPS lint set missing from the crate root.
 
 ## v0.2.0 - Core (DONE)
-The capstone generator (LexerSketch): consumes a .lsf schematic and emits a language.
+The capstone generator (the toolchain): consumes a .lsf schematic and emits a language.
 Dependencies (wires grammar + emitted pipeline) are wired here, when first used.
 Exit criteria:
 - [x] Every public item has rustdoc + a runnable example.
@@ -27,7 +27,7 @@ Delivered:
 
 Dependency decisions (recorded under the anti-deferral rule):
 - **Wired:** `syntax-lang` 1 (the output tree), `diag-lang` 1 (all problems), `pass-lang` 1 (capabilities), `unicode-lang` 1 (XID identifiers).
-- **`grammar-lang` not wired.** When this core was built, grammar-lang was a 0.1.0 scaffold with no API, so the grammar engine (rule language, analysis, interpreter) lives in lang-forge as private modules. *(Updated in 1.0.1:)* grammar-lang has since reached 1.0 as a runtime LALR(1) parser generator with a DFA lexer and Bison-compatible conflict semantics. That is a different engine from lang-forge's ordered choice with speculation, recovery, and Pratt levels, so adopting it is a design decision (which engine LexerSketch forges with, or both), not a drop-in swap; it is tracked in LexerSketch's plan (`_lexersketch/DECISIONS.md`), not here. Nothing about the engine is public, so either choice leaves lang-forge's API unchanged.
+- **`grammar-lang` not wired.** When this core was built, grammar-lang was a 0.1.0 scaffold with no API, so the grammar engine (rule language, analysis, interpreter) lives in lang-forge as private modules. *(Updated in 1.0.1:)* grammar-lang has since reached 1.0 as a runtime LALR(1) parser generator with a DFA lexer and Bison-compatible conflict semantics. That is a different engine from lang-forge's ordered choice with speculation, recovery, and Pratt levels, so adopting it is a design decision (which engine the toolchain forges with, or both), not a drop-in swap; it is tracked in the toolchain's plan (the decision log), not here. Nothing about the engine is public, so either choice leaves lang-forge's API unchanged.
 - **`lexer-lang` not wired.** Its `Cursor` steps a `char` at a time; the derived lexer is table-driven over bytes with ASCII fast paths and only decodes UTF-8 on non-ASCII input. Routing the hot loop through `Cursor` would slow it with nothing gained.
 - **`parser-lang` not wired.** Its `Parser` skips trivia and keeps errors on the side; lang-forge builds lossless trees from an event list that supports speculation and forward-linked operator nodes. The same reasoning kept it out of `incremental-lang`.
 - **`ast-lang` not wired.** A typed AST needs Rust types per language; a language forged at run time has none. The lossless CST is the output, and typed views are the consumer's to build.
@@ -41,12 +41,12 @@ Public surface stable and frozen until 2.0.
 - [x] Full test + benchmark suite green: Windows and Linux (WSL2) locally, stable and 1.85; macOS through the CI matrix.
 
 ## v1.0.1 - Hardening patch (DONE)
-Fixes from the LexerSketch audit (`_lexersketch/ISSUES.md` M01, M03, M06, M07, M08, M09, M10, M11, the strictness part of M14, and F03). No public API change; the `.lsf` format is unchanged, and only schematics that are invalid NOML or hostile are newly refused.
+Fixes from the toolchain's audit (the issue ledger M01, M03, M06, M07, M08, M09, M10, M11, the strictness part of M14, and F03). No public API change; the `.lsf` format is unchanged, and only schematics that are invalid NOML or hostile are newly refused.
 
 Delivered:
 - [x] **M01** The depth-limit flag that limits speculation to one alternative per decision is cleared when an outermost speculation begins and ends, so a construct nested too deeply no longer cripples every later choice in the file; the exponential-time protection inside that speculation is kept.
 - [x] **M03** Hostile-schematic memory: schematics are capped at 8 MiB; the tables that grow with expressions times token kinds (token sets, operator tables) are capped at 256 MiB and checked before allocation; FIRST sets are shared wherever equal by construction and FOLLOW sets are built only where read (the 30,000-keyword grammar went from about 480 MiB to 130 MiB); duplicate-key and duplicate-capability checks use ordered maps instead of scans.
-- [x] **M06** The crate docs, README, API reference, and manifest no longer say forged trees "plug straight into" the formatter, reparser, LSP, and tree-sitter crates: they are trees those crates are designed to consume, and the adapters arrive with LexerSketch.
+- [x] **M06** The crate docs, README, API reference, and manifest no longer say forged trees "plug straight into" the formatter, reparser, LSP, and tree-sitter crates: they are trees those crates are designed to consume, and the adapters arrive with the toolchain.
 - [x] **M07** A leading UTF-8 byte-order mark is skipped in schematics and is trivia in source text (it begins the first `WHITESPACE` token, so trees stay lossless).
 - [x] **M08** The memo keeps remembered events where the parser produced them and moves them only when a rewind would discard them — once, with nested replays kept as references — so its memory no longer grows with nesting depth (60-deep nested speculation: about 253 MiB to 24 MiB peak, and 2.5 times faster).
 - [x] **M09** Schematic nesting is bounded in total (header and dotted-key parts, arrays, and inline tables together, 64 levels), not per kind; the bound also keeps dropping the document shallow, so no iterative drop is needed.
@@ -60,7 +60,7 @@ Dependency wiring: unchanged — `syntax-lang` 1, `diag-lang` 1, `pass-lang` 1, 
 Not in this patch (recorded under the anti-deferral rule): M14's `\x` escape (an addition, not a strictness fix) and the move to a shared NOML reader (D6); M02, M04, M05, M12, M13 (minor or major by their SemVer class).
 
 ## v2.0.0-alpha.1 - LSF2 syntax forge (DONE, 2026-10-09)
-LexerSketch ROADMAP work package 2.1: format-2 sketches (`_lexersketch/specs/LSF2.md` syntax sections §3, §7–§14), the front end for the Mox demo. A major release: format 1 must forge exactly as in 1.x.
+the toolchain ROADMAP work package 2.1: format-2 sketches (the LSF2 specification syntax sections §3, §7–§14), the front end for the Mox demo. A major release: format 1 must forge exactly as in 1.x.
 
 Exit criteria:
 - [x] Format-1 schematics forge and parse exactly as in 1.x; every 1.x test kept, unchanged, as a regression suite (one assertion in `tests/forge.rs` adjusted for the rendered code in the header, the documented breaking change).
@@ -106,10 +106,10 @@ Deferred to **v2.0.0-alpha.2** (each refused with `LSF1007` in alpha.1, never ig
 - **Injection `when`** (inject only when the content matches) and **combined self-injections**: `when` needs a regex test on injected content; a combined self-injection needs one parse over discontiguous ranges. Combined editor injections are listed range by range now.
 - **Checks not run:** `LSF3113` (DFA ambiguity between token classes), `LSF3125` shadowing analysis beyond format 1's literal check, `LSF4303`; and `confusables` (UAX #39 data is not in unicode-lang yet, so `warn`/`deny` give an `LSF1007` warning).
 - **Limits:** kinds are capped at 32,768 (15 index bits, as in 1.x) where LSF2 §1.8 allows 65,535; image warnings are not stored (a loaded language has no `warnings()`).
-- **Spec follow-ups for `_lexersketch`:** codes used that LSF2 §27 does not list yet (`LSF1007` not supported, `LSF4112` rule syntax, `LSF4305`–`LSF4310` format-1 grammar checks, `LSF7004`/`LSF7005` pipeline); Mox's `elseif_clause` needs `allow = ["overlap"]` like `if_stmt`.
+- **Spec follow-ups:** codes used that LSF2 §27 does not list yet (`LSF1007` not supported, `LSF4112` rule syntax, `LSF4305`–`LSF4310` format-1 grammar checks, `LSF7004`/`LSF7005` pipeline); Mox's `elseif_clause` needs `allow = ["overlap"]` like `if_stmt`.
 
 ## v2.0.0-alpha.2 - Parser limits: linear time, a step budget (DONE, 2026-10-13)
-A security fix release, ahead of the LSF2 work alpha.1 scheduled here: past the depth limit, parsing time grew exponentially with each level of nesting (Mox: 56 nested array literals in the test copy of the sketch, 60 in the flagship, did not finish in 30 s; 65 `list(` calls took 77 s; LexerSketch hung). Scope: make reaching the depth limit linear-time, audit every path the memo cannot cover, add an overall work budget (also serving `_lexersketch/ISSUES.md` P46, the Studio's forge timeout, on the parse side).
+A security fix release, ahead of the LSF2 work alpha.1 scheduled here: past the depth limit, parsing time grew exponentially with each level of nesting (Mox: 56 nested array literals in the test copy of the sketch, 60 in the flagship, did not finish in 30 s; 65 `list(` calls took 77 s; the toolchain hung). Scope: make reaching the depth limit linear-time, audit every path the memo cannot cover, add an overall work budget (also serving the issue ledger P46, the Studio's forge timeout, on the parse side).
 
 Confirmed cause: `too_deep` failed the strict attempt that reached the limit and tainted it, so no result around it was memoized, and every retry point above it (each alternative, the item after a failed predicate, the operand after a failed lookahead such as Mox's `&(expr '=>')`) went down the same path again; instrumented, one level past the trip went from 16 to 327,600 limit hits and from 31 k to 7.8 M steps.
 

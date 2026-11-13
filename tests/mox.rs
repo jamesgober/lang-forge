@@ -1,4 +1,4 @@
-//! Mox (the LexerSketch flagship, `_lexersketch/sketches/mox.lsf`): its
+//! Mox (the flagship, the Mox sketch): its
 //! syntax sections forge, and representative templates and scripts parse.
 //!
 //! `tests/sketches/mox.lsf` is a copy of the flagship sketch with one change:
