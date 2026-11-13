@@ -125,7 +125,7 @@ problem. The tree always covers every byte of the source, so it can be printed
 back exactly. It is the family's lossless CST, the tree the formatter,
 incremental reparser, language server, and tree-sitter crates of the `-lang`
 family are designed to consume; the adapters that connect a forged language to
-those crates are not part of lang-forge and arrive with LexerSketch.
+those crates are not part of lang-forge and arrive with the toolchain.
 
 ## Installation
 
@@ -448,11 +448,11 @@ name` must be a language name (`[a-z][a-z0-9_]*`, free text goes to
 `_?[a-z][a-z0-9_]*` (all-uppercase names are token classes), and a greedy
 repetition that would silently reject valid input is an error (`LSF4301`).
 Unknown sections and keys are refused, with a suggestion when one is near;
-sections that other LexerSketch crates read (`[semantics]`, `[types]`,
+sections that other toolchain crates read (`[semantics]`, `[types]`,
 `[runtime]`, `[stdlib]`, `[exec]`, `[tooling]`, `[lints]`, `[macros]`,
 `[emit]`, `[migrate]`) are accepted and left to them.
 
-The full format is specified in LexerSketch's `specs/LSF2.md`; this section
+The full format is specified in the toolchain's `specs/LSF2.md`; this section
 shows what lang-forge does with it, feature by feature, and the
 [coverage table](#lsf2-coverage) lists every key of LSF2's syntax sections
 with its status in this release.

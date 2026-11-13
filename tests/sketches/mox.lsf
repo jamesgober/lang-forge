@@ -1,12 +1,12 @@
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
-#  Mox — the PHP killer · LexerSketch flagship · paper sketch (ROADMAP 1.8)
+#  Mox — the PHP killer · the flagship · paper sketch (ROADMAP 1.8)
 #
 #  Written against specs/LSF2.md (format 2), 2026-10-08, before the forge supports format 2.
 #  lang-forge test copy (2026-10-09): `elseif_clause` moved to table form with `allow = ["overlap"]`
 #  (the only change; see tests/mox.rs).
 #  Design source: LANGUAGES.md "Mox". Where the owner has not decided something, this sketch makes a
 #  documented choice and marks it  [OQ-n]  (owner question n, listed at the end of this file and in
-#  sketches/README.md). Constructs this sketch can describe but that LexerSketch's consumers cannot
+#  sketches/README.md). Constructs this sketch can describe but that the toolchain's consumers cannot
 #  lower yet are routed to the `mox_lower` hook or a pending key, and listed under GAPS at the end.
 #
 #  Shape of the language:

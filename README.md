@@ -3,7 +3,7 @@
     <br>
     <b>lang-forge</b>
     <br>
-    <sub><sup>LEXERSKETCH GENERATOR</sup></sub>
+    <sub><sup>GENERATOR</sup></sub>
 </h1>
 
 <div align="center">
@@ -18,10 +18,10 @@
 
 <div align="left">
     <p>
-        <strong>lang-forge</strong> is LexerSketch: describe a language in a short <code>.lsf</code> schematic &mdash; its tokens, its grammar, its operators and their precedence &mdash; and get a working front end for it. <code>Language::from_lsf</code> reads the schematic, checks it, and compiles it into tables; <code>Language::parse</code> then turns source text into a lossless syntax tree, with a diagnostic for everything malformed. There is no code to generate and nothing to build: the language is ready the moment the schematic is forged.
+        <strong>lang-forge</strong> is a language forge: describe a language in a short <code>.lsf</code> schematic &mdash; its tokens, its grammar, its operators and their precedence &mdash; and get a working front end for it. <code>Language::from_lsf</code> reads the schematic, checks it, and compiles it into tables; <code>Language::parse</code> then turns source text into a lossless syntax tree, with a diagnostic for everything malformed. There is no code to generate and nothing to build: the language is ready the moment the schematic is forged.
     </p>
     <p>
-        It is the capstone of the <code>-lang</code> language-construction family. Trees are <a href="https://crates.io/crates/syntax-lang"><code>syntax-lang</code></a> trees, the lossless CST that the family's formatter, incremental reparser, language server, and tree-sitter crates are designed to consume; the adapters that connect a forged language to those crates are not part of lang-forge and arrive with LexerSketch. Problems are <a href="https://crates.io/crates/diag-lang"><code>diag-lang</code></a> diagnostics, rendered with carets under the source; and the passes a language includes run on <a href="https://crates.io/crates/pass-lang"><code>pass-lang</code></a>. A schematic never bakes a feature in &mdash; it names the capabilities it wants, and the language wires those passes in.
+        It is the capstone of the <code>-lang</code> language-construction family. Trees are <a href="https://crates.io/crates/syntax-lang"><code>syntax-lang</code></a> trees, the lossless CST that the family's formatter, incremental reparser, language server, and tree-sitter crates are designed to consume; the adapters that connect a forged language to those crates are not part of lang-forge and arrive with the toolchain. Problems are <a href="https://crates.io/crates/diag-lang"><code>diag-lang</code></a> diagnostics, rendered with carets under the source; and the passes a language includes run on <a href="https://crates.io/crates/pass-lang"><code>pass-lang</code></a>. A schematic never bakes a feature in &mdash; it names the capabilities it wants, and the language wires those passes in.
     </p>
     <br>
     <hr>
@@ -199,7 +199,7 @@ assert_eq!(help, ["did you mean `statement`?"]);
 
 ## Format 2: LSF2
 
-A sketch that says `[sketch] format = 2` gets LexerSketch's full syntax: its own token classes (regular expressions with conditions), lexer modes with a mode stack, string classes with interpolation, heredocs and raw delimiters, contextual and case-insensitive keywords, indentation layout, labelled fields on tree edges, predicates and back-references, injections, and `[ast]` supertypes. Without `[sketch]` (or with `format = 1`) a schematic is read exactly as 1.x read it.
+A sketch that says `[sketch] format = 2` gets the toolchain's full syntax: its own token classes (regular expressions with conditions), lexer modes with a mode stack, string classes with interpolation, heredocs and raw delimiters, contextual and case-insensitive keywords, indentation layout, labelled fields on tree edges, predicates and back-references, injections, and `[ast]` supertypes. Without `[sketch]` (or with `format = 1`) a schematic is read exactly as 1.x read it.
 
 ```rust
 use lang_forge::Language;
@@ -244,7 +244,7 @@ assert!(hole.children().any(|c| c.kind().label() == Some(value)));
 # Ok::<(), lang_forge::Error>(())
 ```
 
-LexerSketch's flagship, Mox (PHP's syntax with template islands, `$variables`, interpolation, heredocs, and `async`/`await` as contextual keywords), forges from its ~1000-line sketch in about 25 ms and parses its sample scripts and templates without a diagnostic; see [`tests/mox.rs`](./tests/mox.rs). Every key of LSF2's syntax sections and its status in this release is in the [coverage table](./docs/API.md#lsf2-coverage).
+The toolchain's flagship, Mox (PHP's syntax with template islands, `$variables`, interpolation, heredocs, and `async`/`await` as contextual keywords), forges from its ~1000-line sketch in about 25 ms and parses its sample scripts and templates without a diagnostic; see [`tests/mox.rs`](./tests/mox.rs). Every key of LSF2's syntax sections and its status in this release is in the [coverage table](./docs/API.md#lsf2-coverage).
 
 <hr>
 <br>
@@ -308,7 +308,7 @@ The full reference — every key, type, default, and the semantics of parsing an
 
 ## Capabilities
 
-LexerSketch never bakes a language feature in. A schematic names the capabilities it includes; the language assembles them, in order, from whatever registry of passes you provide, and refuses if one is missing:
+The toolchain never bakes a language feature in. A schematic names the capabilities it includes; the language assembles them, in order, from whatever registry of passes you provide, and refuses if one is missing:
 
 ```rust
 use lang_forge::diag_lang::{Diagnostic, Label, Severity};
