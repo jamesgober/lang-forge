@@ -149,10 +149,10 @@
 //! reported and assumed, an unexpected token is reported and wrapped in an
 //! `ERROR` node, and the tree always covers the whole source.
 //!
-//! Parsing takes time linear in the input. Two limits stop a parse where it
-//! is: the depth limit (768 grammar levels, which bounds the stack) and a
-//! step budget proportional to the input ([`ParseBudget`], set per language
-//! with [`Language::with_parse_budget`]). Either one leaves the tree lossless,
+//! Lexing and parsing take time linear in the input. Two limits stop a parse
+//! where it is: the depth limit (768 grammar levels, which bounds the stack)
+//! and a step budget proportional to the input ([`ParseBudget`], set per
+//! language with [`Language::with_parse_budget`]). Either one leaves the tree lossless,
 //! with the tokens not yet parsed in one `ERROR` node, and reports one
 //! diagnostic where the parse stopped; [`Parse::steps`] tells how much work a
 //! parse took.

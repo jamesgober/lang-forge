@@ -2,8 +2,9 @@
 
 > Complete reference for every public item in `lang-forge`, with examples, and
 > for the `.lsf` schematic format it reads.
-> **Status: `2.0.0-alpha.2`, a pre-release of 2.0.** Alpha.2 makes the
-> parser's limits stop a parse in linear time and adds a step budget
+> **Status: `2.0.0-alpha.3`, a pre-release of 2.0.** Alpha.3 makes lexing
+> linear in the input and bounds the time forging takes; alpha.2 made the
+> parser's limits stop a parse in linear time and added a step budget
 > ([`ParseBudget`](#parsebudget)). Everything 1.x provides
 > is kept, and format-1 sketches forge and parse exactly as in 1.x; the
 > format-2 (LSF2) syntax, multi-file sketches, language images, field labels,
@@ -131,7 +132,7 @@ those crates are not part of lang-forge and arrive with LexerSketch.
 
 ```toml
 [dependencies]
-lang-forge = "2.0.0-alpha.2"
+lang-forge = "2.0.0-alpha.3"
 ```
 
 The crate is `no_std`-compatible: disable default features and it needs only
@@ -139,7 +140,7 @@ The crate is `no_std`-compatible: disable default features and it needs only
 
 ```toml
 [dependencies]
-lang-forge = { version = "2.0.0-alpha.2", default-features = false }
+lang-forge = { version = "2.0.0-alpha.3", default-features = false }
 ```
 
 MSRV: Rust 1.85 (Rust 2024 edition). `syntax-lang`, `diag-lang`, and
@@ -497,9 +498,14 @@ The regex dialect (LSF2 §9.12) is the one regular languages need: literals,
 `.`, classes with ranges and negation, `\d \w \s` (ASCII), `\p{XID_Start}`
 and `\p{XID_Continue}`, groups, `|`, `* + ?`, and bounded `{m,n}`. There are no
 back-references or lookaround, so every class compiles to a DFA when the
-sketch is forged and matches in linear time. A regex that matches the empty
-string is refused (`LSF3203`), and so is one whose automaton would pass the
-budget (`LSF3201`, for example `(a|b)*a(a|b){12}`).
+sketch is forged and matches in linear time. The lexer remembers how each
+regex's runs ended, so a regex that reads far past the token it ends up with
+(`-*b` over a long run of dashes) does not make lexing quadratic. A regex that
+matches the empty string is refused (`LSF3203`), and so is one whose automaton
+would pass the budget (`LSF3201`, for example `(a|b)*a(a|b){12}`), one that
+tells more than 256 sets of characters apart, and one that would take compiling
+past the sketch's budget: the token regexes of one sketch may take 8,388,608
+compile steps in all, where the Mox sketch takes about 21,000.
 
 How a token is chosen (LSF2 §9.13): of the candidates active in the current
 mode whose conditions hold, the longest match wins; on equal length, the
@@ -803,28 +809,28 @@ the node and `kind("'instanceof'")` the keyword.
 ### LSF2 coverage
 
 Every key of LSF2's syntax sections (§3, §4, §7–§14) and its status in
-`2.0.0-alpha.2` (unchanged since alpha.1). **Yes**: read and applied. **Checked**: read and validated;
+`2.0.0-alpha.3` (unchanged since alpha.1). **Yes**: read and applied. **Checked**: read and validated;
 its effect belongs to another crate (named), so lang-forge applies nothing.
-**Refused**: read and refused — with `LSF1007` naming the roadmap item
-unless another code is given — never silently ignored. Items marked *alpha.2* are scheduled in
+**Refused**: read and refused, with `LSF1007` naming the roadmap item
+unless another code is given, and never silently ignored. Items marked *alpha.4* are scheduled in
 [`../dev/ROADMAP.md`](../dev/ROADMAP.md) with the reason.
 
 | Section | Key | Status |
 |---|---|---|
 | §3 files | multi-file sketch: entry, `modules`, parts, `SourceMap`, paths (§3.1–§3.4) | Yes ([`Sketch`](#sketch)) |
-| §3 files | `[sketch] kind = "mixin"` | Refused: a mixin is neither an entry nor a part (`LSF2022`, `LSF2024`); *alpha.2*, with composition |
-| §3 files | sketch references (§3.5) | Refused with `extends` (*alpha.2*) |
-| §4 composition | `[language] extends`, `[compose]`, `[sketch] requires`, mixins | Refused (*alpha.2*) |
+| §3 files | `[sketch] kind = "mixin"` | Refused: a mixin is neither an entry nor a part (`LSF2022`, `LSF2024`); *alpha.4*, with composition |
+| §3 files | sketch references (§3.5) | Refused with `extends` (*alpha.4*) |
+| §4 composition | `[language] extends`, `[compose]`, `[sketch] requires`, mixins | Refused (*alpha.4*) |
 | `[sketch]` | `format` | Yes |
 | `[sketch]` | `kind` (`language`, `part`) | Yes |
 | `[sketch]` | `modules` | Yes |
-| `[sketch]` | `requires` | Refused (*alpha.2*) |
+| `[sketch]` | `requires` | Refused (*alpha.4*) |
 | `[sketch.checks]` | `overlap`, `unused_rule`, `unused_token` | Yes |
 | `[sketch.checks]` | `unmapped_node` | Checked (level read; the check is `[semantics]`', not lang-forge's) |
 | `[language]` | `name`, `version`, `extensions`, `start` | Yes (format-2 tightenings applied) |
 | `[language]` | `display_name`, `description`, `edition`, `shebang_names` | Yes (validated and exposed) |
 | `[language]` | `files` (`mode`, `start` per extension) | Yes ([`Language::parse_file`](#languageparse_file)) |
-| `[language]` | `extends` | Refused (*alpha.2*) |
+| `[language]` | `extends` | Refused (*alpha.4*) |
 | `[lexer]` | `identifiers` (string and table: `style`, `extra_start`, `extra_continue`, `normalize`) | Yes |
 | `[lexer]` | `identifiers.confusables` | Checked; `warn`/`deny` give an `LSF1007` warning: UAX #39 data is not in unicode-lang yet |
 | `[lexer]` | `newlines`, `line_comments`, `block_comments`, `nested_comments`, `strings` (array) | Yes |
@@ -835,28 +841,28 @@ unless another code is given — never silently ignored. Items marked *alpha.2* 
 | `[lexer.strings.X]` | `escape`, `multiline`, `interpolate` (`open`, `close`, `rule`, `mode`, `when_next`), `embedded` (`token`, `regex`, `parse`), `escape_tokens` | Yes |
 | `[lexer.strings.X]` | `body`, `close_at`, `close_not_followed_by`, `modes` | Yes |
 | `[lexer.strings.X]` | `rest_of_line = "empty"` | Yes |
-| `[lexer.strings.X]` | `rest_of_line = "code"` | Refused (*alpha.2*: needs a pending-heredoc queue) |
+| `[lexer.strings.X]` | `rest_of_line = "code"` | Refused (*alpha.4*: needs a pending-heredoc queue) |
 | `[lexer.strings.X]` | `escapes` (named and table: `simple`, `octal`, `hex`, `unicode`, `unknown`, `bytes`), `dedent` | Checked (value decoding is lower-lang's) |
 | `[lexer.numbers]` | `radix`, `radix_case`, `separators`, `separator_rule`, `floats`, `exponent`, `leading_dot`, `trailing_dot`, `hex_floats`, `leading_zeros`, `suffixes`, `run_on` | Yes |
 | `[lexer.tokens]` | `regex`, `literal`, `trivia`, `priority`, `modes`, `action`, `followed_by`, `not_followed_by`, `when_prev`, `unless_prev`, `line_start`, `indented`, `column` | Yes |
 | `[lexer.tokens]` | `doc` | Checked (free text; for tools) |
-| `[lexer.tokens]` | `hook` | Refused (*alpha.2*: scanner hooks) |
+| `[lexer.tokens]` | `hook` | Refused (*alpha.4*: scanner hooks) |
 | `[lexer.modes.m]` | `inherit`, `literals`, `builtins`, `trivia`, `tokens`, `strings`, `text`, `actions`, `eof` | Yes |
-| `[lexer.split]` | token splitting | Refused (*alpha.2*) |
+| `[lexer.split]` | token splitting | Refused (*alpha.4*) |
 | `[lexer.columns]` | `tab_width` | Yes |
-| `[lexer.columns]` | `trivia` | Refused (*alpha.2*) |
+| `[lexer.columns]` | `trivia` | Refused (*alpha.4*) |
 | `[layout]` | `style` (`none`, `indent`), `open_after`, `implicit_join`, `explicit_join`, `tabs` (`width`, `mixed`), `blank_lines` | Yes |
-| `[layout]` | `style = "hook"`, `hook` | Refused (*alpha.2*: layout hooks) |
+| `[layout]` | `style = "hook"`, `hook` | Refused (*alpha.4*: layout hooks) |
 | `[layout.newlines]` | `mode`, `terminate_after`, `continue_before`, `ignored_inside` | Yes |
-| `[layout.newlines]` | `soft_terminators` | Refused (*alpha.2*) |
+| `[layout.newlines]` | `soft_terminators` | Refused (*alpha.4*) |
 | `[rules]` | string rules: labels, `&` `!`, `IDENT=label`, `WORD`, `EOF`, `LINE_START`, `NL_BEFORE`, `INDENT`, `DEDENT`, `STRING` as any string class | Yes |
-| `[rules]` | `@hook` (predicate hooks), `%mode(...)` | Refused (*alpha.2*) |
+| `[rules]` | `@hook` (predicate hooks), `%mode(...)` | Refused (*alpha.4*) |
 | `[rules.r]` | `rule`, `sync`, `allow`, `doc` | Yes |
-| `[rules.r]` | `newlines` (rule-scoped) | Refused (*alpha.2*) |
+| `[rules.r]` | `newlines` (rule-scoped) | Refused (*alpha.4*) |
 | expression rules | `operand`, `levels` (`left`, `right`, `none`, `prefix`, `postfix`, `then`, `node`, `prec`), contextual-keyword operators, `doc` | Yes |
-| expression rules | `newlines`, `dynamic` | Refused (*alpha.2*) |
+| expression rules | `newlines`, `dynamic` | Refused (*alpha.4*) |
 | `[injections.id]` | `target`, `language`, `resolve`, `start`, `content`, `combined`, `scope` | Yes (self-injections parsed; others listed as ranges) |
-| `[injections.id]` | `when`; `combined = true` on a self-injection | Refused (*alpha.2*) |
+| `[injections.id]` | `when`; `combined = true` on a self-injection | Refused (*alpha.4*) |
 | `[hooks.id]` | `kind`, `capability`, `tokens`, `token`, `into`, `options` | Checked (hooks are declared and validated; running one needs the hook constructs refused above) |
 | `[ast]` | supertypes | Yes |
 
@@ -2774,6 +2780,11 @@ stack; forging never panics; and `dump` keeps its format (format-2 trees add
   `LF9002` where 1.x went on, however long it took. No input of the example
   languages or the Mox corpus comes near it; `ParseBudget::new(u64::MAX, 0)`
   turns it off.
+- *(2.0.0-alpha.3)* Forging holds the token regexes of a sketch to a compile
+  budget of 8,388,608 steps in all and one regex to 256 sets of characters it
+  tells apart (alpha.2 allowed 4,096), refusing past either with `LSF3201`.
+  The Mox sketch takes about 21,000 steps. `Parse::dump` indents at most 64
+  levels; deeper lines show their depth as `[N] `.
 
 **What the alpha does not promise yet.** The format-2 surface — LSF2's
 syntax as this release reads it, the new methods and types (`Sketch`,

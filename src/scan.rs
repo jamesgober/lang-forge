@@ -34,7 +34,7 @@ use crate::{
     error::Report,
     kind::Kind,
     lexer::{BOM, Keywords, char_at, is_unicode_space, line_end, utf8_len},
-    regex::{CharSet, Props, Regex},
+    regex::{CharSet, Memo, Props, Regex},
     schematic::IdentMode,
     spec2::{ActionSpec, CloseAt, Layout, LeadingZeros, Lexer2, NumbersSpec, Part},
 };
@@ -1132,11 +1132,13 @@ pub(crate) fn compile_regex(
         return Some(r.clone());
     }
     let hir = parse_regex(pattern, span, props, report)?;
+    let mut work = props.work;
     let compiled = if part {
-        Regex::compile_part(&hir, REGEX_STATES)
+        Regex::compile_part(&hir, REGEX_STATES, &mut work)
     } else {
-        Regex::compile(&hir, REGEX_STATES)
+        Regex::compile(&hir, REGEX_STATES, &mut work)
     };
+    props.work = work;
     match compiled {
         Ok(r) => {
             props.cache(pattern, part, &r);
@@ -1147,6 +1149,35 @@ pub(crate) fn compile_regex(
                 codes::REGEX_TOO_LARGE,
                 span,
                 format!("regex `{pattern}` needs more than {REGEX_STATES} automaton states"),
+            );
+            None
+        }
+        Err(crate::regex::CompileError::TooManyClasses) => {
+            report.error(
+                codes::REGEX_TOO_LARGE,
+                span,
+                format!(
+                    "regex `{pattern}` tells more than {} sets of characters apart",
+                    crate::regex::MAX_SYMBOLS
+                ),
+            );
+            None
+        }
+        // Once the budget is spent every later pattern fails the same way;
+        // the first error says why.
+        Err(crate::regex::CompileError::TooCostly) if props.work == 0 && props.spent_reported => {
+            None
+        }
+        Err(crate::regex::CompileError::TooCostly) => {
+            props.work = 0;
+            props.spent_reported = true;
+            report.error(
+                codes::REGEX_TOO_LARGE,
+                span,
+                format!(
+                    "regex `{pattern}` takes too long to compile: the token regexes of a sketch may take {} steps together",
+                    crate::regex::FORGE_WORK
+                ),
             );
             None
         }
@@ -1335,6 +1366,9 @@ struct Run<'a> {
     prev: Option<u16>,
     /// Scratch for a number's diagnostics while it is only a candidate.
     pending: Vec<Diagnostic>,
+    /// What the regex runs so far have learned, so none reads the same text
+    /// twice in the same state.
+    memo: core::cell::RefCell<Memo<'a>>,
 }
 
 impl Scanner {
@@ -1372,6 +1406,7 @@ impl Scanner {
             frames: Vec::from([Frame::Mode(mode.min(self.modes.len() as u16 - 1))]),
             prev: None,
             pending: Vec::new(),
+            memo: core::cell::RefCell::new(Memo::default()),
         };
         if start == 0 {
             run.prologue();
@@ -1386,7 +1421,7 @@ impl Scanner {
     }
 }
 
-impl Run<'_> {
+impl<'a> Run<'a> {
     fn push(&mut self, kind: Kind, start: usize, end: usize) {
         self.tokens
             .push(Token::new(kind, Span::new(start as u32, end as u32)));
@@ -1604,7 +1639,8 @@ impl Run<'_> {
                 if !r.can_start(lead) {
                     continue;
                 }
-                let len = r.longest_match(&self.src[self.pos..self.end]);
+                let len =
+                    r.longest_match_at(self.src, self.pos, self.end, &mut self.memo.borrow_mut());
                 if len > 0 && self.class_ok(class, len) {
                     consider(
                         Candidate {
@@ -2032,6 +2068,11 @@ impl Run<'_> {
         }
     }
 
+    /// The length of `r`'s match at `at`, if it matches.
+    fn match_len(&self, r: &'a Regex, at: usize) -> Option<usize> {
+        r.match_len_at(self.src, at, self.end, &mut self.memo.borrow_mut())
+    }
+
     /// Matches the opener of part-string `si` here: its length and capture.
     fn match_open(&self, si: u16) -> Option<(usize, (u32, u32))> {
         let class = &self.sc.strings[si as usize];
@@ -2046,9 +2087,9 @@ impl Run<'_> {
                     }
                     at += t.len();
                 }
-                PartRt::Regex(r) => at += r.match_len(&self.src[at..self.end])?,
+                PartRt::Regex(r) => at += self.match_len(r, at)?,
                 PartRt::Capture(r) => {
-                    let len = r.match_len(&self.src[at..self.end])?;
+                    let len = self.match_len(r, at)?;
                     capture = (at as u32, (at + len) as u32);
                     at += len;
                 }
@@ -2062,7 +2103,7 @@ impl Run<'_> {
     /// Matches the close parts of `class` at `at`; the end, if they match.
     fn match_close_parts(
         &self,
-        class: &StrClass,
+        class: &'a StrClass,
         mut at: usize,
         capture: (u32, u32),
     ) -> Option<usize> {
@@ -2075,9 +2116,7 @@ impl Run<'_> {
                     }
                     at += t.len();
                 }
-                PartRt::Regex(r) | PartRt::Capture(r) => {
-                    at += r.match_len(&self.src[at..self.end])?
-                }
+                PartRt::Regex(r) | PartRt::Capture(r) => at += self.match_len(r, at)?,
                 PartRt::Backref => {
                     let text = &self.bytes[capture.0 as usize..capture.1 as usize];
                     if !rest.starts_with(text) {
@@ -2096,7 +2135,7 @@ impl Run<'_> {
     /// `(start of the close token, end)`.
     fn match_close(
         &self,
-        class: &StrClass,
+        class: &'a StrClass,
         capture: (u32, u32),
         content_start: usize,
     ) -> Option<(usize, usize)> {
@@ -2189,7 +2228,7 @@ impl Run<'_> {
 
     /// Scans a plain string's content and close from the current position;
     /// returns the token's end.
-    fn single_string(&mut self, class: &StrClass, capture: (u32, u32), opener: Span) -> usize {
+    fn single_string(&mut self, class: &'a StrClass, capture: (u32, u32), opener: Span) -> usize {
         let content_start = self.pos;
         loop {
             if self.pos >= self.end {
@@ -2296,7 +2335,7 @@ impl Run<'_> {
             }
             let mut best: Option<(usize, usize)> = None;
             for (ei, r) in class.embedded.iter().enumerate() {
-                let len = r.longest_match(&self.src[at..self.end]);
+                let len = r.longest_match_at(self.src, at, self.end, &mut self.memo.borrow_mut());
                 if len > 0 && best.is_none_or(|(l, _)| len > l) {
                     best = Some((len, ei));
                 }

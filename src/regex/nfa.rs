@@ -11,7 +11,7 @@ use super::parse::Hir;
 /// The most NFA states the lexer may need. Patterns stay far below this; the
 /// bound exists so a pattern like `(a{1000}){1000}` fails cleanly instead of
 /// exhausting memory.
-const STATE_LIMIT: usize = 1 << 20;
+pub(crate) const STATE_LIMIT: usize = 1 << 18;
 
 /// One NFA state.
 #[derive(Clone, Debug)]
@@ -45,6 +45,8 @@ pub(crate) struct Builder<'a> {
     starts: Vec<u32>,
     /// Each class of the pattern, as runs of the symbols it contains.
     symbols: &'a Symbols<'a>,
+    /// The most states this builder may make.
+    limit: usize,
 }
 
 impl<'a> Builder<'a> {
@@ -53,7 +55,14 @@ impl<'a> Builder<'a> {
             states: Vec::new(),
             starts: Vec::new(),
             symbols,
+            limit: STATE_LIMIT,
         }
+    }
+
+    /// Lowers the state limit to `limit`, if that is below [`STATE_LIMIT`].
+    pub(crate) fn with_limit(mut self, limit: u64) -> Self {
+        self.limit = usize::try_from(limit).map_or(STATE_LIMIT, |l| l.min(STATE_LIMIT));
+        self
     }
 
     /// Adds a token whose pattern is `hir`; reaching its end yields
@@ -76,7 +85,7 @@ impl<'a> Builder<'a> {
     }
 
     fn push(&mut self, state: State) -> Result<u32, TooLarge> {
-        if self.states.len() >= STATE_LIMIT {
+        if self.states.len() >= self.limit {
             return Err(TooLarge);
         }
         self.states.push(state);

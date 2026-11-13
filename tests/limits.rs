@@ -9,6 +9,11 @@
 //! took exponential time in a grammar whose statement list recurses through
 //! `NEWLINE` (one cut by the progress guard kept every enclosing result out
 //! of the memo).
+//!
+//! From 2.0.0-alpha.3: the format-2 lexer takes time linear in the input
+//! (a token regex that reads far past its token made it quadratic), forging
+//! holds the token regexes to a compile budget, and `Parse::dump` stays linear
+//! in the tree.
 
 use std::time::{Duration, Instant};
 
@@ -455,4 +460,161 @@ proptest! {
         prop_assert!(stops <= 1);
         prop_assert!(steps <= 64 * (tokens + 1), "{} steps for {} tokens: {:?}", steps, tokens, src);
     }
+}
+
+// ----- the lexer: linear in the input -----
+
+/// A format-2 sketch with the given `[lexer]` tables and a grammar that takes
+/// any token.
+fn lexer_sketch(lexer: &str) -> Language {
+    let src = format!(
+        "[sketch]\nformat = 2\n[language]\nname = \"lex\"\nversion = \"1.0.0\"\n{lexer}[rules]\nfile = \"any*\"\nany = \"T | U\"\n"
+    );
+    Language::from_lsf(&src).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Lexes `src` and returns how long it took, checking the tokens cover it.
+fn time_lex(lang: &Language, src: &str) -> Duration {
+    let started = Instant::now();
+    let tokens = lang.lex(src);
+    let took = started.elapsed();
+    let covered: usize = tokens.iter().map(|t| t.span().len() as usize).sum();
+    assert_eq!(covered, src.len());
+    took
+}
+
+#[test]
+fn test_token_regex_that_runs_past_its_token_lexes_in_linear_time() {
+    // At every dash, `T` reads to the end of the input looking for a `b`, and
+    // `U` takes the dash. Each later run reads what the first one did, so a
+    // lexer without memory takes time quadratic in the run of dashes (about
+    // 15 minutes for 1 MB). With it, 400,000 dashes take milliseconds.
+    let lang = lexer_sketch("[lexer.tokens]\nT = { regex = '-*b' }\nU = { literal = \"-\" }\n");
+    let took = time_lex(&lang, &"-".repeat(400_000));
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    // Each of those is one dash.
+    assert_eq!(lang.lex(&"-".repeat(1000)).len(), 1000);
+    assert_eq!(lang.lex(&format!("{}b", "-".repeat(1000))).len(), 1);
+}
+
+#[test]
+fn test_token_regex_whose_match_a_condition_refuses_lexes_in_linear_time() {
+    // `T` matches up to the `b` from every dash, and its condition refuses
+    // every one of those matches.
+    let lang = lexer_sketch(
+        "[lexer.tokens]\nT = { regex = '-*b', not_followed_by = \"b\" }\nU = { regex = '[-b]' }\n",
+    );
+    let src = format!("{}bb", "-".repeat(400_000));
+    let took = time_lex(&lang, &src);
+    assert!(took < Duration::from_secs(10), "{took:?}");
+}
+
+#[test]
+fn test_string_opener_regex_part_lexes_in_linear_time() {
+    // The opener's regex part reads every dash from every dash, and the quote
+    // it then needs never comes.
+    let lang = lexer_sketch(
+        "[lexer.strings.S]\nopen = [{ regex = '-*' }, '\"']\nclose = '\"'\n[lexer.tokens]\nT = { literal = \"t\" }\nU = { literal = \"-\" }\n",
+    );
+    let took = time_lex(&lang, &"-".repeat(400_000));
+    assert!(took < Duration::from_secs(10), "{took:?}");
+}
+
+// ----- forging: bounded in time as well as memory -----
+
+/// Forges a format-2 sketch with the given token classes, timing it.
+fn time_forge(tokens: &str) -> (Result<Language, lang_forge::Error>, Duration) {
+    let src = format!(
+        "[sketch]\nformat = 2\n[language]\nname = \"forge\"\nversion = \"1.0.0\"\n[lexer.tokens]\n{tokens}[rules]\nfile = \"T*\"\n"
+    );
+    let started = Instant::now();
+    let lang = Language::from_lsf(&src);
+    (lang, started.elapsed())
+}
+
+/// The codes of a refused forge.
+fn refused_codes(result: Result<Language, lang_forge::Error>) -> Vec<String> {
+    match result {
+        Ok(_) => panic!("forged"),
+        Err(e) => e
+            .diagnostics()
+            .iter()
+            .map(|d| d.code().map(|c| c.to_string()).unwrap_or_default())
+            .collect(),
+    }
+}
+
+#[test]
+fn test_regex_of_many_distinct_classes_is_refused_quickly() {
+    // `a[^c1]?[^c2]?...[^cN]?` is small to write, and determinizing it costs
+    // time cubic in N: a thousand classes took over half a minute to forge.
+    for n in [250u32, 1000, 4000] {
+        let mut pattern = String::from("a");
+        for i in 0..n {
+            let c = char::from_u32(0x4E00 + i).expect("CJK");
+            pattern.push_str(&format!("[^{c}]?"));
+        }
+        let (result, took) = time_forge(&format!("T = {{ regex = '{pattern}' }}\n"));
+        assert_eq!(refused_codes(result), ["LSF3201"], "n = {n}");
+        assert!(took < Duration::from_secs(5), "n = {n}: {took:?}");
+    }
+}
+
+#[test]
+fn test_nested_counted_repetition_is_refused_quickly() {
+    for pattern in [
+        "((x?){1000}){400}",
+        "((x?){100}){100}",
+        "((x?){1000}){1000}",
+    ] {
+        let (result, took) = time_forge(&format!("T = {{ regex = '{pattern}' }}\n"));
+        assert_eq!(refused_codes(result), ["LSF3201"], "{pattern}");
+        assert!(took < Duration::from_secs(5), "{pattern}: {took:?}");
+    }
+}
+
+#[test]
+fn test_regex_compile_budget_covers_the_whole_sketch() {
+    // Each pattern alone is allowed; together they take more than a sketch
+    // may spend.
+    let one = |c: char| format!("{c}(({c}?){{60}}){{8}}");
+    let mut tokens = String::new();
+    let mut fits = true;
+    for (i, c) in ('a'..='z').enumerate() {
+        tokens.push_str(&format!("T{i} = {{ regex = '{}' }}\n", one(c)));
+        let (result, _) = time_forge(&format!("T = {{ regex = '{}' }}\n", one(c)));
+        fits &= result.is_ok();
+    }
+    assert!(fits, "each pattern forges alone");
+    let src = format!(
+        "[sketch]\nformat = 2\n[language]\nname = \"forge\"\nversion = \"1.0.0\"\n[lexer.tokens]\n{tokens}[rules]\nfile = \"T0*\"\n"
+    );
+    let started = Instant::now();
+    let codes = refused_codes(Language::from_lsf(&src));
+    assert!(codes.iter().any(|c| c == "LSF3201"), "{codes:?}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+// ----- the tree dump: linear in the tree -----
+
+#[test]
+fn test_dump_of_a_deep_tree_stays_linear() {
+    // A left-associative chain nests one level per operator. Indenting every
+    // level made the dump grow with the square of the depth (193 MB for a
+    // 16 KB chain).
+    let calc = Language::from_lsf(include_str!("../examples/schematics/calc.lsf"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let src = format!("{}1;", "1+".repeat(8000));
+    let parse = calc.parse(&src);
+    let dump = parse.dump();
+    assert!(
+        dump.len() < 500 * src.len(),
+        "{} bytes for {} bytes of source",
+        dump.len(),
+        src.len()
+    );
+    assert!(dump.lines().any(|l| l.trim_start().starts_with("[65] ")));
+    // Shallow trees dump as before.
+    let shallow = calc.parse("1+2;").dump();
+    assert!(!shallow.contains('['), "{shallow}");
 }
